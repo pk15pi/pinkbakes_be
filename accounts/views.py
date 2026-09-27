@@ -3,6 +3,10 @@ import random
 import secrets
 from datetime import timedelta
 
+import secrets
+from datetime import timedelta
+
+from django.conf import settings
 from django.contrib.auth import login
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import User
@@ -12,12 +16,19 @@ from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import UserProfile
+from .email_service import build_password_reset_email_html, build_verification_email_html, send_html_email
+from .models import PasswordResetToken, UserProfile
 from .serializers import SigninSerializer, SignupSerializer
 
 
 def _verification_link(token):
-    return f"http://127.0.0.1:8000/api/accounts/verify-email/?token={token}"
+    base_url = getattr(settings, 'FRONTEND_URL', 'https://pinkbakes.com')
+    return f"{base_url.rstrip('/')}/verify-email?token={token}"
+
+
+def _password_reset_link(token):
+    base_url = getattr(settings, 'FRONTEND_URL', 'https://pinkbakes.com')
+    return f"{base_url.rstrip('/')}/reset-password/{token}"
 
 
 def _mask_email(email):
@@ -46,11 +57,14 @@ class SignupView(APIView):
         if serializer.is_valid():
             user, profile = serializer.save()
             token, _ = Token.objects.get_or_create(user=user)
+            verification_url = _verification_link(profile.verification_token)
+            email_html = build_verification_email_html(user.first_name or user.username, verification_url)
+            send_html_email('Verify Your PinkBakes Account', [user.email], email_html)
             return Response(
                 {
                     'message': 'Account created successfully. Please verify your email or mobile number before you can sign in.',
                     'token': token.key,
-                    'verification_link': _verification_link(profile.verification_token),
+                    'verification_link': verification_url,
                     'verification_token': profile.verification_token,
                     'otp': profile.otp_code,
                     'user': {
@@ -126,6 +140,13 @@ class SendVerificationView(APIView):
         profile.otp_attempts = 0
         profile.otp_last_sent_at = now
         profile.save()
+
+        email_html = build_verification_email_html(user.first_name or user.username, _verification_link(profile.verification_token))
+        send_html_email(
+            'Verify Your PinkBakes Account',
+            [user.email],
+            email_html,
+        )
 
         return Response(
             {
@@ -224,6 +245,96 @@ class VerifyOtpView(APIView):
         profile.save()
 
         return Response({'message': 'Mobile verification successful. You can now sign in.'}, status=status.HTTP_200_OK)
+
+
+class ForgotPasswordView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        email = (request.data.get('email') or '').strip().lower()
+        if not email:
+            return Response({'detail': 'Email address is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = User.objects.filter(email__iexact=email).first()
+        if user:
+            old_tokens = PasswordResetToken.objects.filter(user=user, used_at__isnull=True, expires_at__gt=timezone.now())
+            for token in old_tokens:
+                token.used_at = timezone.now()
+                token.save(update_fields=['used_at'])
+
+            token = secrets.token_urlsafe(32)
+            PasswordResetToken.objects.create(
+                user=user,
+                token_hash=PasswordResetToken.hash_token(token),
+                expires_at=timezone.now() + timedelta(hours=1),
+            )
+
+            reset_url = _password_reset_link(token)
+            html_body = build_password_reset_email_html(user.first_name or user.username, reset_url)
+            send_html_email('Reset Your PinkBakes Password', [user.email], html_body)
+
+        return Response({
+            'message': 'If an account exists with this email address, a password reset link has been sent.'
+        }, status=status.HTTP_200_OK)
+
+
+class VerifyResetTokenView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        token = (request.data.get('token') or '').strip()
+        if not token:
+            return Response({'detail': 'Reset token is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        token_hash = PasswordResetToken.hash_token(token)
+        reset_token = PasswordResetToken.objects.filter(token_hash=token_hash, used_at__isnull=True).first()
+        if not reset_token:
+            return Response({'detail': 'This password reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if timezone.now() > reset_token.expires_at:
+            return Response({'detail': 'This password reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({'message': 'Reset token is valid.'}, status=status.HTTP_200_OK)
+
+
+class ResetPasswordView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        token = (request.data.get('token') or '').strip()
+        password = request.data.get('password')
+        confirm_password = request.data.get('confirm_password')
+
+        if not token:
+            return Response({'detail': 'Reset token is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not password or len(password) < 8:
+            return Response({'detail': 'Password must be at least 8 characters long.'}, status=status.HTTP_400_BAD_REQUEST)
+        if password != confirm_password:
+            return Response({'detail': 'Passwords do not match.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        token_hash = PasswordResetToken.hash_token(token)
+        reset_token = PasswordResetToken.objects.filter(token_hash=token_hash, used_at__isnull=True).first()
+        if not reset_token:
+            return Response({'detail': 'This password reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if timezone.now() > reset_token.expires_at:
+            reset_token.used_at = timezone.now()
+            reset_token.save(update_fields=['used_at'])
+            return Response({'detail': 'This password reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = reset_token.user
+        user.set_password(password)
+        user.save(update_fields=['password'])
+
+        reset_token.used_at = timezone.now()
+        reset_token.save(update_fields=['used_at'])
+
+        PasswordResetToken.objects.filter(user=user, used_at__isnull=True).update(used_at=timezone.now())
+
+        return Response({'message': 'Your password has been reset successfully.'}, status=status.HTTP_200_OK)
 
 
 class MeView(APIView):

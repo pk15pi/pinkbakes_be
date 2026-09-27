@@ -1,5 +1,25 @@
+import hashlib
+
 from django.conf import settings
 from django.db import models
+
+
+class PasswordResetToken(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='password_reset_tokens')
+    token_hash = models.CharField(max_length=128, unique=True)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    @staticmethod
+    def hash_token(token):
+        return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+    def __str__(self):
+        return f"Password reset for {self.user.username}"
 
 
 class UserProfile(models.Model):
