@@ -37,6 +37,43 @@ class PasswordResetFlowTests(TestCase):
         self.user.profile.mobile_verified = True
         self.user.profile.save(update_fields=['is_verified', 'email_verified', 'mobile_verified'])
 
+    def test_request_login_otp_for_verified_mobile_generates_hash_and_returns_generic_message(self):
+        response = self.client.post('/api/accounts/request-login-otp/', {'mobile': '+91 9876543210'}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertIn('message', data)
+        self.assertIn('otp', data['message'].lower())
+        self.user.profile.refresh_from_db()
+        self.assertIsNotNone(self.user.profile.otp_hash)
+        self.assertIsNotNone(self.user.profile.otp_expires_at)
+
+    def test_verify_login_otp_returns_auth_token_for_verified_user(self):
+        self.user.profile.otp_hash = make_password('123456')
+        self.user.profile.otp_expires_at = timezone.now() + timedelta(minutes=5)
+        self.user.profile.otp_attempts = 0
+        self.user.profile.mobile_verified = True
+        self.user.profile.is_verified = True
+        self.user.profile.save(update_fields=['otp_hash', 'otp_expires_at', 'otp_attempts', 'mobile_verified', 'is_verified'])
+
+        response = self.client.post('/api/accounts/verify-login-otp/', {'mobile': '9876543210', 'otp': '123456'}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertIn('token', data)
+        self.assertEqual(data['user']['username'], self.user.username)
+
+    def test_verify_login_otp_rejects_wrong_code(self):
+        self.user.profile.otp_hash = make_password('654321')
+        self.user.profile.otp_expires_at = timezone.now() + timedelta(minutes=5)
+        self.user.profile.otp_attempts = 0
+        self.user.profile.mobile_verified = True
+        self.user.profile.is_verified = True
+        self.user.profile.save(update_fields=['otp_hash', 'otp_expires_at', 'otp_attempts', 'mobile_verified', 'is_verified'])
+
+        response = self.client.post('/api/accounts/verify-login-otp/', {'mobile': '9876543210', 'otp': '123456'}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.profile.refresh_from_db()
+        self.assertEqual(self.user.profile.otp_attempts, 1)
+
     def test_forgot_password_returns_generic_response_and_sends_email(self):
         response = self.client.post('/api/accounts/forgot-password/', {'email': 'resetuser@example.com'}, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)

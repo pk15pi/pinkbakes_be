@@ -25,6 +25,60 @@ class CatalogAPITests(TestCase):
             is_active=True,
         )
 
+    def test_order_checkout_creates_order_and_items_for_authenticated_user(self):
+        user = User.objects.create_user(username='customer', email='customer@example.com', password='securepass123')
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post('/api/orders/checkout/', {
+            'items': [
+                {'id': self.product.id, 'quantity': 2},
+            ],
+            'customer_name': 'Customer Name',
+            'customer_email': 'customer@example.com',
+            'customer_mobile': '9876543210',
+            'shipping_address': '12 Market Road',
+            'shipping_address_2': 'Near Station',
+            'city': 'Mumbai',
+            'state': 'Maharashtra',
+            'postal_code': '400001',
+            'country': 'India',
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        data = response.json()
+        self.assertIn('order_number', data)
+        self.assertEqual(float(data['total_amount']), 2160.0)
+        self.assertEqual(data['items'][0]['product_name'], 'Chocolate Truffle Cake')
+        self.assertEqual(data['items'][0]['quantity'], 2)
+
+    def test_order_history_returns_only_current_user_orders(self):
+        user_a = User.objects.create_user(username='customer_a', email='a@example.com', password='pass12345')
+        user_b = User.objects.create_user(username='customer_b', email='b@example.com', password='pass12345')
+        self.client.force_authenticate(user=user_a)
+
+        order_payload = {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'customer_name': 'A',
+            'customer_email': 'a@example.com',
+            'customer_mobile': '1111111111',
+            'shipping_address': 'A Street',
+            'city': 'City',
+            'state': 'State',
+            'postal_code': '123456',
+            'country': 'India',
+        }
+        first = self.client.post('/api/orders/checkout/', order_payload, format='json')
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=user_b)
+        response = self.client.get('/api/orders/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()['count'], 0)
+
+    def test_guest_user_cannot_checkout(self):
+        response = self.client.post('/api/orders/checkout/', {'items': [{'id': self.product.id, 'quantity': 1}]}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
     def test_product_listing_returns_discounted_price_and_rating(self):
         Review.objects.create(product=self.product, user=self.admin, name='Admin', rating=5, comment='Great cake', status='approved')
         response = self.client.get('/api/catalog/products/')

@@ -113,6 +113,73 @@ class ProductView(models.Model):
         return f'View for {self.product.name}'
 
 
+class Order(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('confirmed', 'Confirmed'),
+        ('processing', 'Processing'),
+        ('out_for_delivery', 'Out for Delivery'),
+        ('delivered', 'Delivered'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    PAYMENT_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('paid', 'Paid'),
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+    ]
+
+    user = models.ForeignKey(User, related_name='orders', on_delete=models.CASCADE)
+    order_number = models.CharField(max_length=40, unique=True)
+    customer_name = models.CharField(max_length=120)
+    customer_email = models.EmailField()
+    customer_mobile = models.CharField(max_length=20)
+    shipping_address = models.CharField(max_length=255)
+    shipping_address_2 = models.CharField(max_length=255, blank=True, default='')
+    city = models.CharField(max_length=80)
+    state = models.CharField(max_length=80)
+    postal_code = models.CharField(max_length=20)
+    country = models.CharField(max_length=80)
+    subtotal_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    delivery_fee = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='pending')
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
+    notes = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['status', 'created_at']),
+            models.Index(fields=['order_number']),
+        ]
+
+    def __str__(self):
+        return f'{self.order_number} - {self.customer_name}'
+
+
+class OrderItem(models.Model):
+    order = models.ForeignKey('Order', related_name='items', on_delete=models.CASCADE)
+    product = models.ForeignKey('Product', related_name='order_items', on_delete=models.SET_NULL, null=True, blank=True)
+    product_name = models.CharField(max_length=160)
+    product_image = models.URLField(blank=True, default='')
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    quantity = models.PositiveIntegerField(default=1)
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f'{self.product_name} x {self.quantity}'
+
+
 class AdminActivity(models.Model):
     ACTION_CHOICES = [
         ('login', 'Login'),

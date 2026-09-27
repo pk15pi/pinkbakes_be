@@ -48,6 +48,27 @@ def _mask_mobile(mobile):
     return f"{digits[:2]}******{digits[-2:]}"
 
 
+def _normalize_mobile_number(value):
+    digits = ''.join(ch for ch in str(value or '') if ch.isdigit())
+    if len(digits) > 10:
+        digits = digits[-10:]
+    return digits
+
+
+def _find_user_by_mobile(mobile):
+    digits = _normalize_mobile_number(mobile)
+    if not digits:
+        return None
+
+    for profile in UserProfile.objects.select_related('user').all():
+        profile_digits = _normalize_mobile_number(profile.mobile_number)
+        if profile_digits == digits:
+            return profile.user
+        if profile_digits and digits.endswith(profile_digits):
+            return profile.user
+    return None
+
+
 class SignupView(APIView):
     authentication_classes = []
     permission_classes = []
@@ -245,6 +266,101 @@ class VerifyOtpView(APIView):
         profile.save()
 
         return Response({'message': 'Mobile verification successful. You can now sign in.'}, status=status.HTTP_200_OK)
+
+
+class RequestLoginOtpView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        mobile = (request.data.get('mobile') or '').strip()
+        if not mobile:
+            return Response({'detail': 'Mobile number is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = _find_user_by_mobile(mobile)
+        if not user:
+            return Response({
+                'message': 'If this mobile number is registered, an OTP has been sent to it.'
+            }, status=status.HTTP_200_OK)
+
+        profile = getattr(user, 'profile', None)
+        if not profile:
+            return Response({
+                'message': 'If this mobile number is registered, an OTP has been sent to it.'
+            }, status=status.HTTP_200_OK)
+
+        if not user.is_active or not profile.is_verified:
+            return Response({'detail': 'Your account is not active yet. Please verify your email or mobile number first.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp = str(random.randint(100000, 999999))
+        profile.otp_code = otp
+        profile.otp_hash = make_password(otp)
+        profile.otp_created_at = timezone.now()
+        profile.otp_expires_at = timezone.now() + timedelta(minutes=10)
+        profile.otp_attempts = 0
+        profile.otp_last_sent_at = timezone.now()
+        profile.save(update_fields=['otp_code', 'otp_hash', 'otp_created_at', 'otp_expires_at', 'otp_attempts', 'otp_last_sent_at'])
+
+        return Response({
+            'message': f'OTP sent successfully. Use the code {otp} to sign in.',
+            'otp': otp,
+        }, status=status.HTTP_200_OK)
+
+
+class VerifyLoginOtpView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        mobile = (request.data.get('mobile') or '').strip()
+        otp = (request.data.get('otp') or '').strip()
+
+        if not mobile or not otp:
+            return Response({'detail': 'Mobile number and OTP are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = _find_user_by_mobile(mobile)
+        if not user:
+            return Response({'detail': 'The mobile number is not registered.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        profile = getattr(user, 'profile', None)
+        if not profile:
+            return Response({'detail': 'User profile not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if user.is_active is False or profile.is_verified is False:
+            return Response({'detail': 'Your account has not been verified. Please verify your email or mobile number before signing in.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if profile.otp_expires_at and timezone.now() > profile.otp_expires_at:
+            return Response({'detail': 'This OTP has expired. Please request a new one.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if profile.otp_attempts >= 5:
+            return Response({'detail': 'Too many OTP attempts. Please request a new code.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        if not profile.otp_hash or not check_password(str(otp).strip(), profile.otp_hash):
+            profile.otp_attempts += 1
+            profile.save(update_fields=['otp_attempts'])
+            return Response({'detail': 'Invalid OTP.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        login(request, user)
+        token, _ = Token.objects.get_or_create(user=user)
+        profile.otp_code = None
+        profile.otp_hash = None
+        profile.otp_created_at = None
+        profile.otp_expires_at = None
+        profile.otp_attempts = 0
+        profile.save(update_fields=['otp_code', 'otp_hash', 'otp_created_at', 'otp_expires_at', 'otp_attempts'])
+
+        return Response({
+            'message': 'OTP login successful.',
+            'token': token.key,
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'email': user.email,
+                'mobile_number': profile.mobile_number,
+            },
+        }, status=status.HTTP_200_OK)
 
 
 class ForgotPasswordView(APIView):

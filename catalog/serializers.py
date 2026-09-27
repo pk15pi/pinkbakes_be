@@ -2,7 +2,58 @@ from django.db.models import Avg
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from .models import Product, Review
+from .models import Order, OrderItem, Product, Review
+
+
+class OrderItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderItem
+        fields = [
+            'id',
+            'product',
+            'product_name',
+            'product_image',
+            'unit_price',
+            'quantity',
+            'subtotal',
+        ]
+        read_only_fields = ['id', 'product_name', 'product_image', 'unit_price', 'subtotal']
+
+    def get_product_name(self, obj):
+        return obj.product_name or (obj.product.name if obj.product else 'Product')
+
+
+class OrderSerializer(serializers.ModelSerializer):
+    items = OrderItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Order
+        fields = [
+            'id',
+            'order_number',
+            'customer_name',
+            'customer_email',
+            'customer_mobile',
+            'shipping_address',
+            'shipping_address_2',
+            'city',
+            'state',
+            'postal_code',
+            'country',
+            'subtotal_amount',
+            'delivery_fee',
+            'tax_amount',
+            'total_amount',
+            'status',
+            'payment_status',
+            'notes',
+            'created_at',
+            'updated_at',
+            'items',
+        ]
+        read_only_fields = fields
 
 
 class ReviewSerializer(serializers.ModelSerializer):
