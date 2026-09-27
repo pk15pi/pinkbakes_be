@@ -75,18 +75,29 @@ class Review(models.Model):
 
     product = models.ForeignKey('Product', related_name='reviews', on_delete=models.CASCADE)
     user = models.ForeignKey(User, related_name='reviews', on_delete=models.CASCADE, null=True, blank=True)
+    order = models.ForeignKey('Order', related_name='reviews', on_delete=models.SET_NULL, null=True, blank=True)
+    order_item = models.ForeignKey('OrderItem', related_name='reviews', on_delete=models.SET_NULL, null=True, blank=True)
     name = models.CharField(max_length=80, blank=True, default='')
     rating = models.PositiveSmallIntegerField(default=5)
     comment = models.TextField()
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='approved')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    admin_comment = models.TextField(blank=True, default='')
+    approved_by = models.ForeignKey(User, related_name='approved_reviews', on_delete=models.SET_NULL, null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['user', 'order_item'], name='unique_review_per_order_item'),
+        ]
         indexes = [
             models.Index(fields=['product', 'status', 'created_at']),
             models.Index(fields=['rating', 'status']),
+            models.Index(fields=['user', 'status']),
+            models.Index(fields=['order', 'status']),
             models.Index(fields=['created_at']),
         ]
 
@@ -113,14 +124,43 @@ class ProductView(models.Model):
         return f'View for {self.product.name}'
 
 
+class Employee(models.Model):
+    STATUS_CHOICES = [
+        ('ACTIVE', 'Active'),
+        ('INACTIVE', 'Inactive'),
+        ('AVAILABLE', 'Available'),
+        ('BUSY', 'Busy'),
+        ('ON_LEAVE', 'On Leave'),
+    ]
+
+    user = models.OneToOneField(User, related_name='employee_profile', on_delete=models.SET_NULL, null=True, blank=True)
+    employee_id = models.CharField(max_length=30, unique=True)
+    name = models.CharField(max_length=120)
+    contact_number = models.CharField(max_length=20)
+    email = models.EmailField(blank=True, default='')
+    photo = models.URLField(blank=True, default='')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return f'{self.name} ({self.employee_id})'
+
+
 class Order(models.Model):
     STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('confirmed', 'Confirmed'),
-        ('processing', 'Processing'),
-        ('out_for_delivery', 'Out for Delivery'),
-        ('delivered', 'Delivered'),
-        ('cancelled', 'Cancelled'),
+        ('PENDING', 'Pending'),
+        ('ORDER_CONFIRMED', 'Order Confirmed'),
+        ('PREPARING', 'Preparing'),
+        ('DELIVERY_BOY_ASSIGNED', 'Delivery Boy Assigned'),
+        ('PACKING', 'Packing'),
+        ('READY_FOR_DELIVERY', 'Ready for Delivery'),
+        ('OUT_FOR_DELIVERY', 'Out for Delivery'),
+        ('DELIVERED', 'Delivered'),
+        ('CANCELLED', 'Cancelled'),
     ]
 
     PAYMENT_STATUS_CHOICES = [
@@ -145,8 +185,12 @@ class Order(models.Model):
     delivery_fee = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='pending')
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='ORDER_CONFIRMED')
     payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
+    delivery_employee = models.ForeignKey('Employee', related_name='orders_assigned', on_delete=models.SET_NULL, null=True, blank=True)
+    delivery_assigned_at = models.DateTimeField(null=True, blank=True)
+    delivery_started_at = models.DateTimeField(null=True, blank=True)
+    delivery_completed_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -157,6 +201,7 @@ class Order(models.Model):
             models.Index(fields=['user', 'created_at']),
             models.Index(fields=['status', 'created_at']),
             models.Index(fields=['order_number']),
+            models.Index(fields=['delivery_employee', 'created_at']),
         ]
 
     def __str__(self):
@@ -178,6 +223,84 @@ class OrderItem(models.Model):
 
     def __str__(self):
         return f'{self.product_name} x {self.quantity}'
+
+
+class Payment(models.Model):
+    STATUS_CHOICES = [
+        ('created', 'Created'),
+        ('pending', 'Pending'),
+        ('authorized', 'Authorized'),
+        ('paid', 'Paid'),
+        ('failed', 'Failed'),
+        ('cancelled', 'Cancelled'),
+        ('refunded', 'Refunded'),
+        ('partially_refunded', 'Partially Refunded'),
+    ]
+
+    order = models.ForeignKey('Order', related_name='payments', on_delete=models.CASCADE, null=True, blank=True)
+    user = models.ForeignKey(User, related_name='payments', on_delete=models.CASCADE)
+    gateway = models.CharField(max_length=40, default='razorpay')
+    gateway_order_id = models.CharField(max_length=120, unique=True)
+    gateway_payment_id = models.CharField(max_length=120, blank=True, default='')
+    gateway_signature = models.CharField(max_length=255, blank=True, default='')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    currency = models.CharField(max_length=10, default='INR')
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default='created')
+    payment_method = models.CharField(max_length=40, blank=True, default='')
+    failure_reason = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['order', 'status']),
+            models.Index(fields=['gateway_order_id']),
+            models.Index(fields=['gateway_payment_id']),
+        ]
+
+    def __str__(self):
+        return f'{self.user.username} - {self.gateway_order_id} - {self.status}'
+
+
+class OrderStatusHistory(models.Model):
+    order = models.ForeignKey('Order', related_name='status_history', on_delete=models.CASCADE)
+    status = models.CharField(max_length=40)
+    message = models.CharField(max_length=255, blank=True, default='')
+    changed_by = models.ForeignKey(User, related_name='order_status_updates', on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['order', 'created_at']),
+            models.Index(fields=['status', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.order.order_number} - {self.status}'
+
+
+class DeliveryLocation(models.Model):
+    order = models.ForeignKey('Order', related_name='delivery_locations', on_delete=models.CASCADE)
+    employee = models.ForeignKey('Employee', related_name='location_updates', on_delete=models.CASCADE)
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    accuracy = models.FloatField(default=0)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['order', 'timestamp']),
+            models.Index(fields=['employee', 'timestamp']),
+        ]
+
+    def __str__(self):
+        return f'{self.employee.name} - {self.latitude}, {self.longitude}'
 
 
 class AdminActivity(models.Model):

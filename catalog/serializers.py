@@ -2,7 +2,44 @@ from django.db.models import Avg
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from .models import Order, OrderItem, Product, Review
+from .models import DeliveryLocation, Employee, Order, OrderItem, OrderStatusHistory, Payment, Product, Review
+
+
+class EmployeeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Employee
+        fields = [
+            'id',
+            'employee_id',
+            'name',
+            'contact_number',
+            'email',
+            'photo',
+            'status',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_contact_number(self, value):
+        value = value.strip()
+        if len(value) < 8:
+            raise serializers.ValidationError('Contact number must be at least 8 digits.')
+        return value
+
+
+class OrderStatusHistorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderStatusHistory
+        fields = ['id', 'status', 'message', 'changed_by', 'created_at']
+        read_only_fields = fields
+
+
+class DeliveryLocationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DeliveryLocation
+        fields = ['id', 'order', 'employee', 'latitude', 'longitude', 'accuracy', 'timestamp']
+        read_only_fields = ['id', 'order', 'employee', 'timestamp']
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -27,6 +64,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
+    delivery_employee = EmployeeSerializer(read_only=True)
+    status_history = OrderStatusHistorySerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
@@ -48,17 +87,48 @@ class OrderSerializer(serializers.ModelSerializer):
             'total_amount',
             'status',
             'payment_status',
+            'delivery_employee',
+            'delivery_assigned_at',
+            'delivery_started_at',
+            'delivery_completed_at',
             'notes',
             'created_at',
             'updated_at',
             'items',
+            'status_history',
         ]
         read_only_fields = fields
+
+
+class PaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Payment
+        fields = [
+            'id',
+            'order',
+            'user',
+            'gateway',
+            'gateway_order_id',
+            'gateway_payment_id',
+            'gateway_signature',
+            'amount',
+            'currency',
+            'status',
+            'payment_method',
+            'failure_reason',
+            'created_at',
+            'updated_at',
+            'paid_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'paid_at', 'gateway_payment_id', 'gateway_signature']
 
 
 class ReviewSerializer(serializers.ModelSerializer):
     user_name = serializers.SerializerMethodField()
     name = serializers.CharField(required=False, allow_blank=True)
+    order = serializers.PrimaryKeyRelatedField(read_only=True)
+    order_item = serializers.PrimaryKeyRelatedField(read_only=True)
+    admin_comment = serializers.CharField(required=False, allow_blank=True)
 
     class Meta:
         model = Review
@@ -68,13 +138,19 @@ class ReviewSerializer(serializers.ModelSerializer):
             'user',
             'user_name',
             'name',
+            'order',
+            'order_item',
             'rating',
             'comment',
             'status',
+            'admin_comment',
+            'approved_by',
+            'approved_at',
+            'rejected_at',
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'product', 'user', 'user_name', 'created_at', 'updated_at', 'status']
+        read_only_fields = ['id', 'product', 'user', 'user_name', 'order', 'order_item', 'created_at', 'updated_at', 'status', 'admin_comment', 'approved_by', 'approved_at', 'rejected_at']
 
     def get_user_name(self, obj):
         if obj.user:
@@ -90,8 +166,10 @@ class ReviewSerializer(serializers.ModelSerializer):
         cleaned = value.strip()
         if not cleaned:
             raise serializers.ValidationError('Review comment cannot be empty.')
-        if len(cleaned) > 500:
-            raise serializers.ValidationError('Review comment must be 500 characters or fewer.')
+        if len(cleaned) < 5:
+            raise serializers.ValidationError('Review comment must be at least 5 characters long.')
+        if len(cleaned) > 1000:
+            raise serializers.ValidationError('Review comment must be 1000 characters or fewer.')
         return cleaned
 
 
@@ -100,7 +178,7 @@ class ProductSerializer(serializers.ModelSerializer):
     gallery = serializers.SerializerMethodField()
     images = serializers.SerializerMethodField()
     three_d_assets = serializers.ListField(child=serializers.URLField(), required=False, default=list, allow_empty=True)
-    reviews = ReviewSerializer(many=True, read_only=True)
+    reviews = serializers.SerializerMethodField()
     discounted_price = serializers.SerializerMethodField()
     average_rating = serializers.SerializerMethodField()
     review_count = serializers.SerializerMethodField()
@@ -168,6 +246,9 @@ class ProductSerializer(serializers.ModelSerializer):
 
     def get_discounted_price(self, obj):
         return float(obj.discounted_price.quantize(__import__('decimal').Decimal('0.01')))
+
+    def get_reviews(self, obj):
+        return ReviewSerializer(obj.reviews.filter(status='approved').order_by('-created_at'), many=True).data
 
     def get_average_rating(self, obj):
         reviews = obj.reviews.filter(status='approved')
