@@ -2,7 +2,7 @@ from django.db.models import Avg
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from .models import DeliveryLocation, Employee, Order, OrderItem, OrderStatusHistory, Payment, Product, Review
+from .models import DeliveryLocation, Employee, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review
 
 
 class EmployeeSerializer(serializers.ModelSerializer):
@@ -42,6 +42,30 @@ class DeliveryLocationSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'order', 'employee', 'timestamp']
 
 
+
+class RefundSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Refund
+        fields = [
+            'id',
+            'order',
+            'payment',
+            'user',
+            'gateway',
+            'gateway_refund_id',
+            'amount',
+            'currency',
+            'reason',
+            'status',
+            'initiated_by',
+            'initiated_by_type',
+            'failure_reason',
+            'created_at',
+            'updated_at',
+            'processed_at',
+        ]
+        read_only_fields = fields
+
 class OrderItemSerializer(serializers.ModelSerializer):
     product_name = serializers.SerializerMethodField()
 
@@ -66,6 +90,9 @@ class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
     delivery_employee = EmployeeSerializer(read_only=True)
     status_history = OrderStatusHistorySerializer(many=True, read_only=True)
+    cancellable = serializers.SerializerMethodField()
+    refunds = serializers.SerializerMethodField()
+    refunds_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -92,12 +119,46 @@ class OrderSerializer(serializers.ModelSerializer):
             'delivery_started_at',
             'delivery_completed_at',
             'notes',
+            'cancellation_reason',
+            'cancelled_by',
+            'cancelled_at',
             'created_at',
             'updated_at',
             'items',
             'status_history',
+            'cancellable',
+            'refunds',
+            'refunds_summary',
         ]
         read_only_fields = fields
+
+    def get_cancellable(self, obj):
+        request = self.context.get('request')
+        if request and getattr(request.user, 'is_staff', False):
+            return obj.is_admin_cancellable()
+        return obj.is_customer_cancellable()
+
+    def get_refunds(self, obj):
+        refunds = getattr(obj, 'refunds', None)
+        if refunds is None:
+            return []
+        qs = refunds.all().order_by('-created_at')
+        return RefundSerializer(qs, many=True).data
+
+    def get_refunds_summary(self, obj):
+        refunds = list(getattr(obj, 'refunds', Refund.objects.none()).all())
+        completed = [r for r in refunds if r.status == 'completed']
+        pending = [r for r in refunds if r.status in ('requested', 'pending', 'processing')]
+        failed = [r for r in refunds if r.status == 'failed']
+        completed_total = sum((r.amount for r in completed), __import__('decimal').Decimal('0'))
+        return {
+            'count': len(refunds),
+            'completed_count': len(completed),
+            'pending_count': len(pending),
+            'failed_count': len(failed),
+            'completed_amount': float(completed_total),
+            'latest_status': refunds[0].status if refunds else None,
+        }
 
 
 class PaymentSerializer(serializers.ModelSerializer):
@@ -185,6 +246,12 @@ class ProductSerializer(serializers.ModelSerializer):
     price = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False, default=0)
     rating = serializers.DecimalField(max_digits=3, decimal_places=1, min_value=0, max_value=5, required=False, default=0)
     discount = serializers.IntegerField(min_value=0, max_value=100, required=False, default=0)
+    available_quantity = serializers.IntegerField(min_value=0, required=False)
+    low_stock_threshold = serializers.IntegerField(min_value=0, required=False)
+    stock_remaining = serializers.SerializerMethodField()
+    is_low_stock = serializers.SerializerMethodField()
+    reserved_quantity = serializers.SerializerMethodField()
+    sold_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -206,6 +273,13 @@ class ProductSerializer(serializers.ModelSerializer):
             'three_d_model',
             'three_d_assets',
             'availability',
+            'available_quantity',
+            'stock_remaining',
+            'is_low_stock',
+            'low_stock_threshold',
+            'reserved_quantity',
+            'sold_quantity',
+            'stock_updated_at',
             'status',
             'featured',
             'delivery_time',
@@ -217,7 +291,7 @@ class ProductSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'slug', 'discounted_price', 'average_rating', 'review_count', 'created_at', 'updated_at', 'reviews']
+        read_only_fields = ['id', 'slug', 'discounted_price', 'average_rating', 'review_count', 'created_at', 'updated_at', 'reviews', 'stock_remaining', 'is_low_stock', 'stock_updated_at', 'reserved_quantity', 'sold_quantity']
 
     def get_image(self, obj):
         return obj.main_image or (obj.images[0] if obj.images else '')
@@ -258,6 +332,38 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_review_count(self, obj):
         return obj.reviews.filter(status='approved').count()
 
+    def _is_staff_request(self):
+        request = self.context.get('request')
+        return bool(request and getattr(request.user, 'is_authenticated', False) and getattr(request.user, 'is_staff', False))
+
+    def get_stock_remaining(self, obj):
+        return int(getattr(obj, 'available_quantity', 0) or 0)
+
+    def get_is_low_stock(self, obj):
+        available = int(getattr(obj, 'available_quantity', 0) or 0)
+        threshold = int(getattr(obj, 'low_stock_threshold', 5) or 5)
+        return 0 < available <= threshold
+
+    def get_reserved_quantity(self, obj):
+        if not self._is_staff_request():
+            return None
+        return int(getattr(obj, 'reserved_quantity', 0) or 0)
+
+    def get_sold_quantity(self, obj):
+        if not self._is_staff_request():
+            return None
+        return int(getattr(obj, 'sold_quantity', 0) or 0)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not self._is_staff_request():
+            data.pop('reserved_quantity', None)
+            data.pop('sold_quantity', None)
+            # Keep low_stock_threshold visible? Prefer hide internal for customers.
+            data.pop('low_stock_threshold', None)
+        return data
+
+
     def validate_discount(self, value):
         if value is None:
             return 0
@@ -277,12 +383,23 @@ class ProductSerializer(serializers.ModelSerializer):
         if images and not validated_data.get('main_image'):
             validated_data['main_image'] = images[0]
         validated_data['slug'] = slugify(validated_data.get('name', '')) or 'product'
+        # Default stock for newly created products when not provided.
+        if 'available_quantity' not in validated_data:
+            availability = validated_data.get('availability', 'in_stock')
+            if availability == 'out_of_stock':
+                validated_data['available_quantity'] = 0
+            elif availability == 'low_stock':
+                validated_data['available_quantity'] = 3
+            else:
+                validated_data['available_quantity'] = 50
         product = Product.objects.create(**validated_data)
         if images:
             product.images = images
         if 'three_d_assets' in validated_data and validated_data['three_d_assets'] is not None:
             product.three_d_assets = validated_data['three_d_assets']
         product.save(update_fields=['images', 'three_d_assets'])
+        from .inventory import sync_availability
+        sync_availability(product, save=True)
         return product
 
     def update(self, instance, validated_data):
@@ -295,8 +412,13 @@ class ProductSerializer(serializers.ModelSerializer):
             instance.images = validated_data['images']
         if 'three_d_assets' in validated_data:
             instance.three_d_assets = validated_data['three_d_assets']
-        for field in ['category', 'price', 'discount', 'short_description', 'description', 'three_d_model', 'availability', 'status', 'badge', 'featured', 'delivery_time', 'is_active']:
+        for field in ['category', 'price', 'discount', 'short_description', 'description', 'three_d_model', 'availability', 'status', 'badge', 'featured', 'delivery_time', 'is_active', 'available_quantity', 'low_stock_threshold']:
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
         instance.save()
+        if any(f in validated_data for f in ('available_quantity', 'low_stock_threshold', 'availability')):
+            from .inventory import sync_availability
+            # If admin manually set availability without qty, leave qty; prefer qty-driven sync.
+            if 'available_quantity' in validated_data or 'low_stock_threshold' in validated_data:
+                sync_availability(instance, save=True)
         return instance

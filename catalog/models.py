@@ -38,6 +38,12 @@ class Product(models.Model):
     featured = models.BooleanField(default=False)
     delivery_time = models.CharField(max_length=40, blank=True, default='24-48 hours')
     is_active = models.BooleanField(default=True)
+    # Inventory: available is sellable; reserved held for unpaid orders; sold after payment.
+    available_quantity = models.PositiveIntegerField(default=50)
+    reserved_quantity = models.PositiveIntegerField(default=0)
+    sold_quantity = models.PositiveIntegerField(default=0)
+    low_stock_threshold = models.PositiveIntegerField(default=5)
+    stock_updated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -192,6 +198,9 @@ class Order(models.Model):
     delivery_started_at = models.DateTimeField(null=True, blank=True)
     delivery_completed_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True, default='')
+    cancellation_reason = models.TextField(blank=True, default='')
+    cancelled_by = models.ForeignKey(User, related_name='cancelled_orders', on_delete=models.SET_NULL, null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -206,6 +215,24 @@ class Order(models.Model):
 
     def __str__(self):
         return f'{self.order_number} - {self.customer_name}'
+
+    def is_customer_cancellable(self):
+        """Customer may cancel early-stage or unpaid orders."""
+        if self.status == 'CANCELLED':
+            return False
+        if self.status in ('OUT_FOR_DELIVERY', 'DELIVERED'):
+            return False
+        if self.status in ('PENDING', 'ORDER_CONFIRMED', 'PREPARING'):
+            return True
+        if self.payment_status in ('pending', 'failed') and self.status not in (
+            'DELIVERY_BOY_ASSIGNED', 'PACKING', 'READY_FOR_DELIVERY', 'OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED',
+        ):
+            return True
+        return False
+
+    def is_admin_cancellable(self):
+        """Admin may cancel any order that is not delivered or already cancelled."""
+        return self.status not in ('DELIVERED', 'CANCELLED')
 
 
 class OrderItem(models.Model):
@@ -233,6 +260,7 @@ class Payment(models.Model):
         ('paid', 'Paid'),
         ('failed', 'Failed'),
         ('cancelled', 'Cancelled'),
+        ('refund_pending', 'Refund Pending'),
         ('refunded', 'Refunded'),
         ('partially_refunded', 'Partially Refunded'),
     ]
@@ -281,6 +309,60 @@ class OrderStatusHistory(models.Model):
 
     def __str__(self):
         return f'{self.order.order_number} - {self.status}'
+
+
+
+class Refund(models.Model):
+    STATUS_CHOICES = [
+        ('requested', 'Requested'),
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('cancelled', 'Cancelled'),
+    ]
+    INITIATED_BY_TYPE_CHOICES = [
+        ('customer', 'Customer'),
+        ('admin', 'Admin'),
+        ('system', 'System'),
+    ]
+
+    order = models.ForeignKey('Order', related_name='refunds', on_delete=models.CASCADE)
+    payment = models.ForeignKey('Payment', related_name='refunds', on_delete=models.CASCADE)
+    user = models.ForeignKey(User, related_name='refunds', on_delete=models.CASCADE)
+    gateway = models.CharField(max_length=40, default='razorpay')
+    gateway_refund_id = models.CharField(max_length=120, blank=True, default='')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    currency = models.CharField(max_length=10, default='INR')
+    reason = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default='requested')
+    initiated_by = models.ForeignKey(
+        User, related_name='initiated_refunds', on_delete=models.SET_NULL, null=True, blank=True,
+    )
+    initiated_by_type = models.CharField(max_length=20, choices=INITIATED_BY_TYPE_CHOICES, default='customer')
+    failure_reason = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['order', 'created_at']),
+            models.Index(fields=['payment', 'status']),
+            models.Index(fields=['gateway_refund_id']),
+            models.Index(fields=['status', 'created_at']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['gateway', 'gateway_refund_id'],
+                condition=~models.Q(gateway_refund_id=''),
+                name='unique_gateway_refund_id_when_set',
+            ),
+        ]
+
+    def __str__(self):
+        return f'Refund {self.id} for order {self.order_id} - {self.status}'
 
 
 class DeliveryLocation(models.Model):
@@ -333,3 +415,41 @@ class AdminActivity(models.Model):
 
     def __str__(self):
         return f'{self.admin_user.username} - {self.action}'
+
+
+class InventoryTransaction(models.Model):
+    ADJUSTMENT_CHOICES = [
+        ('INITIAL_STOCK', 'Initial Stock'),
+        ('RESTOCK', 'Restock'),
+        ('MANUAL_ADJUSTMENT', 'Manual Adjustment'),
+        ('ORDER_RESERVED', 'Order Reserved'),
+        ('ORDER_CONSUMED', 'Order Consumed'),
+        ('ORDER_RELEASED', 'Order Released'),
+        ('ORDER_RESTORED', 'Order Restored'),
+        ('CORRECTION', 'Correction'),
+    ]
+
+    product = models.ForeignKey('Product', related_name='inventory_transactions', on_delete=models.CASCADE)
+    quantity_change = models.IntegerField(default=0)
+    previous_quantity = models.IntegerField(default=0)
+    new_quantity = models.IntegerField(default=0)
+    adjustment_type = models.CharField(max_length=30, choices=ADJUSTMENT_CHOICES)
+    reason = models.TextField(blank=True, default='')
+    reference_type = models.CharField(max_length=40, blank=True, default='')
+    reference_id = models.CharField(max_length=64, blank=True, default='')
+    performed_by = models.ForeignKey(
+        User, related_name='inventory_transactions', on_delete=models.SET_NULL, null=True, blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['product', 'created_at']),
+            models.Index(fields=['reference_type', 'reference_id']),
+            models.Index(fields=['adjustment_type', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.product_id} {self.adjustment_type} {self.quantity_change}'
+

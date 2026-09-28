@@ -1,12 +1,14 @@
 import hashlib
 import hmac
+import json
 from decimal import Decimal
 
 from django.conf import settings
+from django.http import RawPostDataException
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
-from django.db.models import Avg, Q, Sum
+from django.db.models import Avg, F, Q, Sum
 from django.utils import timezone
 from rest_framework import generics, permissions, status
 from rest_framework.authtoken.models import Token
@@ -14,8 +16,17 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .admin_reporting import AdminReportingService
-from .models import AdminActivity, DeliveryLocation, Employee, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Review
-from .serializers import DeliveryLocationSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductSerializer, ReviewSerializer
+from . import inventory as inventory_service
+from .inventory import InsufficientStock, InventoryError
+from .models import AdminActivity, DeliveryLocation, Employee, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
+from .serializers import DeliveryLocationSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
+from accounts.email_service import (
+    send_order_cancellation_email,
+    send_order_confirmation_email,
+    send_refund_completed_email,
+    send_refund_failed_email,
+    send_refund_initiated_email,
+)
 
 
 class IsAdminUser(permissions.BasePermission):
@@ -119,12 +130,418 @@ class PaymentService:
             product = Product.objects.filter(id=product_id, is_active=True).first()
             if not product:
                 raise ValueError(f'Product #{product_id} is unavailable.')
+            # Aggregate later for multi-line same product; provisional per-line check.
+            available = int(getattr(product, 'available_quantity', 0) or 0)
+            if available < quantity or product.availability == 'out_of_stock':
+                raise ValueError(
+                    f'Only {available} units of "{product.name}" are currently available.'
+                )
             normalized.append({
                 'product': product,
                 'quantity': quantity,
                 'unit_price': product.discounted_price,
             })
+        # Re-check aggregated quantities under current stock.
+        totals = {}
+        for row in normalized:
+            pid = row['product'].id
+            totals[pid] = totals.get(pid, 0) + row['quantity']
+        for row in normalized:
+            pid = row['product'].id
+            available = int(getattr(row['product'], 'available_quantity', 0) or 0)
+            if totals[pid] > available:
+                raise ValueError(
+                    f'Only {available} units of "{row["product"].name}" are currently available.'
+                )
         return normalized
+
+    @staticmethod
+    def should_use_live_razorpay():
+        """Call Razorpay Orders API only when payments are enabled and real keys are configured."""
+        if not getattr(settings, 'PAYMENT_ENABLED', False):
+            return False
+        key_id = (getattr(settings, 'RAZORPAY_KEY_ID', '') or '').strip()
+        key_secret = (getattr(settings, 'RAZORPAY_KEY_SECRET', '') or '').strip()
+        if not key_id or not key_secret:
+            return False
+        # Keep local deterministic ids for placeholder/default secrets used in tests and .env.example.
+        if key_id in ('rzp_test_default_key',) or key_secret in ('test_razorpay_secret',):
+            return False
+        return True
+
+    @staticmethod
+    def create_razorpay_order(amount_paise, receipt, notes=None):
+        """
+        Create a Razorpay order when PAYMENT_ENABLED and keys are set.
+        Otherwise return a deterministic local gateway_order_id for tests/dev.
+        Signature verification still uses RAZORPAY_KEY_SECRET from settings.
+        """
+        amount_paise = int(amount_paise)
+        receipt = str(receipt)[:40]
+        notes = notes or {}
+
+        if PaymentService.should_use_live_razorpay():
+            import razorpay
+            client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+            order = client.order.create({
+                'amount': amount_paise,
+                'currency': getattr(settings, 'RAZORPAY_CURRENCY', 'INR'),
+                'receipt': receipt,
+                'notes': notes,
+                'payment_capture': 1,
+            })
+            return order['id']
+
+        return f"order_{receipt}_{int(timezone.now().timestamp())}"
+
+    @staticmethod
+    def amount_paise(amount):
+        return int((Decimal(amount) * 100).quantize(Decimal('1')))
+
+    @staticmethod
+    def mark_payment_paid(payment, gateway_payment_id, signature=None, source='verify', changed_by=None, payment_method=None):
+        """
+        Idempotent: set Payment paid, Order payment_status=paid, confirm order,
+        write OrderStatusHistory once, and send confirmation email once.
+        """
+        already_paid = payment.status == 'paid'
+
+        update_fields = ['updated_at']
+        if gateway_payment_id and payment.gateway_payment_id != gateway_payment_id:
+            payment.gateway_payment_id = gateway_payment_id
+            update_fields.append('gateway_payment_id')
+        if signature and payment.gateway_signature != signature:
+            payment.gateway_signature = signature
+            update_fields.append('gateway_signature')
+        if payment_method and payment.payment_method != payment_method:
+            payment.payment_method = payment_method
+            update_fields.append('payment_method')
+        elif not payment.payment_method:
+            payment.payment_method = 'razorpay'
+            update_fields.append('payment_method')
+
+        if not already_paid:
+            payment.status = 'paid'
+            payment.paid_at = timezone.now()
+            payment.failure_reason = ''
+            update_fields.extend(['status', 'paid_at', 'failure_reason'])
+
+        payment.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        order = payment.order
+        if not order:
+            return payment
+
+        order_was_unpaid = order.payment_status != 'paid'
+        if order_was_unpaid:
+            order.payment_status = 'paid'
+            # Keep existing status names; only lift PENDING into ORDER_CONFIRMED.
+            if order.status in ('PENDING', 'pending'):
+                order.status = 'ORDER_CONFIRMED'
+            order.save(update_fields=['payment_status', 'status', 'updated_at'])
+
+            has_confirm_history = OrderStatusHistory.objects.filter(
+                order=order, status='ORDER_CONFIRMED'
+            ).exists()
+            if not has_confirm_history:
+                OrderStatusHistory.objects.create(
+                    order=order,
+                    status='ORDER_CONFIRMED',
+                    message=f'Payment confirmed via {source} and order confirmed.',
+                    changed_by=changed_by,
+                )
+
+        # Send confirmation email only on first successful transition to paid.
+        if not already_paid and order_was_unpaid:
+            try:
+                send_order_confirmation_email(order)
+            except Exception:
+                # Do not fail payment confirmation if email delivery fails.
+                pass
+
+        # Convert reserved stock → sold exactly once (idempotent via InventoryTransaction).
+        try:
+            inventory_service.consume(order.id, user=changed_by)
+        except Exception:
+            # Stock consume must not roll back a confirmed payment; log-worthy but soft-fail.
+            pass
+
+        return payment
+
+
+    @staticmethod
+    def refundable_amount(payment):
+        completed = Refund.objects.filter(
+            payment=payment, status='completed'
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        return (Decimal(payment.amount) - Decimal(completed)).quantize(Decimal('0.01'))
+
+    @staticmethod
+    def apply_refund_completion(refund, send_email=True):
+        """Mark refund completed and update Payment / Order payment_status. Idempotent."""
+        payment = refund.payment
+        order = refund.order
+        if refund.status != 'completed':
+            refund.status = 'completed'
+            refund.processed_at = timezone.now()
+            refund.failure_reason = ''
+            refund.save(update_fields=['status', 'processed_at', 'failure_reason', 'updated_at'])
+
+        remaining = PaymentService.refundable_amount(payment)
+        if remaining <= Decimal('0'):
+            payment.status = 'refunded'
+            if order and order.payment_status != 'refunded':
+                order.payment_status = 'refunded'
+                order.save(update_fields=['payment_status', 'updated_at'])
+        else:
+            payment.status = 'partially_refunded'
+            # Keep order.payment_status as paid for partial refunds (choices have no partially_refunded).
+        payment.save(update_fields=['status', 'updated_at'])
+
+        if send_email and order:
+            try:
+                send_refund_completed_email(order, refund)
+            except Exception:
+                pass
+        return refund
+
+    @staticmethod
+    def create_refund(payment, amount=None, reason='', initiated_by=None, initiated_by_type='customer'):
+        """
+        Create a Refund and call Razorpay when live keys are configured.
+        Does NOT hold a DB transaction across the gateway HTTP call.
+        Full refund amount defaults to payment.amount (backend-calculated).
+        """
+        if payment.status not in ('paid', 'refund_pending', 'partially_refunded'):
+            raise ValueError('Only paid payments can be refunded.')
+
+        amount = Decimal(amount if amount is not None else payment.amount).quantize(Decimal('0.01'))
+        if amount <= Decimal('0'):
+            raise ValueError('Refund amount must be greater than zero.')
+
+        refundable = PaymentService.refundable_amount(payment)
+        if amount > refundable:
+            raise ValueError(f'Refund amount exceeds refundable balance of {refundable}.')
+
+        # Idempotency: block another non-failed refund that would cover the same full remaining amount
+        # when a matching open/completed refund already exists for this payment+amount.
+        open_or_done = Refund.objects.filter(
+            payment=payment,
+            amount=amount,
+            status__in=['requested', 'pending', 'processing', 'completed'],
+        )
+        if open_or_done.exists():
+            raise ValueError('A refund for this amount is already in progress or completed.')
+
+        order = payment.order
+        if not order:
+            raise ValueError('Payment is not linked to an order.')
+
+        refund = Refund.objects.create(
+            order=order,
+            payment=payment,
+            user=payment.user,
+            gateway=payment.gateway or 'razorpay',
+            amount=amount,
+            currency=payment.currency or getattr(settings, 'RAZORPAY_CURRENCY', 'INR'),
+            reason=(reason or '')[:2000],
+            status='requested',
+            initiated_by=initiated_by,
+            initiated_by_type=initiated_by_type or 'customer',
+        )
+
+        # Mark payment refund_pending while gateway processes (keep paid until completion preferred;
+        # refund_pending communicates in-flight state without inventing Order statuses).
+        if payment.status == 'paid':
+            payment.status = 'refund_pending'
+            payment.save(update_fields=['status', 'updated_at'])
+
+        try:
+            send_refund_initiated_email(order, refund)
+        except Exception:
+            pass
+
+        # Gateway call OUTSIDE any caller transaction.
+        try:
+            if PaymentService.should_use_live_razorpay() and payment.gateway_payment_id:
+                import razorpay
+                client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+                payload = {
+                    'amount': PaymentService.amount_paise(amount),
+                    'notes': {
+                        'order_id': str(order.id),
+                        'order_number': order.order_number,
+                        'refund_id': str(refund.id),
+                        'reason': (reason or '')[:200],
+                    },
+                }
+                result = client.payment.refund(payment.gateway_payment_id, payload)
+                refund.gateway_refund_id = str(result.get('id') or '')
+                gateway_status = (result.get('status') or '').lower()
+                if gateway_status in ('processed', 'completed'):
+                    refund.status = 'completed'
+                    refund.processed_at = timezone.now()
+                    refund.save(update_fields=['gateway_refund_id', 'status', 'processed_at', 'updated_at'])
+                    PaymentService.apply_refund_completion(refund, send_email=True)
+                else:
+                    refund.status = 'processing'
+                    refund.save(update_fields=['gateway_refund_id', 'status', 'updated_at'])
+            else:
+                # Local/test simulation: complete immediately.
+                refund.gateway_refund_id = f"rfnd_sim_{refund.id}_{int(timezone.now().timestamp())}"
+                refund.status = 'completed'
+                refund.processed_at = timezone.now()
+                refund.save(update_fields=['gateway_refund_id', 'status', 'processed_at', 'updated_at'])
+                PaymentService.apply_refund_completion(refund, send_email=True)
+        except Exception as exc:
+            refund.status = 'failed'
+            refund.failure_reason = str(exc)[:1000]
+            refund.save(update_fields=['status', 'failure_reason', 'updated_at'])
+            # On Razorpay failure: Payment stays paid (or revert from refund_pending), Order stays CANCELLED if already set.
+            if payment.status == 'refund_pending':
+                payment.status = 'paid'
+                payment.save(update_fields=['status', 'updated_at'])
+            try:
+                send_refund_failed_email(order, refund)
+            except Exception:
+                pass
+
+        refund.refresh_from_db()
+        payment.refresh_from_db()
+        return refund
+
+    @staticmethod
+    def sync_refund_from_webhook(refund_entity, event):
+        """Idempotently apply refund.processed / refund.failed webhook payloads."""
+        gateway_refund_id = str(refund_entity.get('id') or '')
+        gateway_payment_id = str(refund_entity.get('payment_id') or '')
+        amount_paise = refund_entity.get('amount')
+        refund = None
+        if gateway_refund_id:
+            refund = Refund.objects.filter(gateway_refund_id=gateway_refund_id).first()
+        if refund is None and gateway_payment_id:
+            payment = Payment.objects.filter(gateway_payment_id=gateway_payment_id).order_by('-created_at').first()
+            if payment:
+                refund = Refund.objects.filter(
+                    payment=payment,
+                    status__in=['requested', 'pending', 'processing'],
+                ).order_by('-created_at').first()
+                if refund and gateway_refund_id and not refund.gateway_refund_id:
+                    refund.gateway_refund_id = gateway_refund_id
+                    refund.save(update_fields=['gateway_refund_id', 'updated_at'])
+
+        if refund is None:
+            return None
+
+        if event in ('refund.processed', 'payment.refunded'):
+            if refund.status == 'completed':
+                return refund  # idempotent
+            if amount_paise is not None:
+                try:
+                    expected = PaymentService.amount_paise(refund.amount)
+                    if int(amount_paise) != expected:
+                        # Do not fail hard; store note but still complete if gateway says processed.
+                        refund.failure_reason = (refund.failure_reason or '') + f' amount note:{amount_paise}'
+                except (TypeError, ValueError):
+                    pass
+            return PaymentService.apply_refund_completion(refund, send_email=True)
+
+        if event == 'refund.failed':
+            if refund.status == 'completed':
+                return refund
+            refund.status = 'failed'
+            notes = refund_entity.get('notes')
+            note_reason = notes.get('reason') if isinstance(notes, dict) else None
+            refund.failure_reason = str(
+                refund_entity.get('error_description')
+                or note_reason
+                or refund_entity.get('status')
+                or 'Refund failed at gateway.'
+            )[:1000]
+            refund.save(update_fields=['status', 'failure_reason', 'updated_at'])
+            payment = refund.payment
+            if payment.status == 'refund_pending':
+                payment.status = 'paid'
+                payment.save(update_fields=['status', 'updated_at'])
+            try:
+                send_refund_failed_email(refund.order, refund)
+            except Exception:
+                pass
+            return refund
+
+        return refund
+
+    @staticmethod
+    def cancel_order(order, actor, reason='', initiated_by_type='customer', allow_admin=False):
+        """
+        Cancel an order with ownership/eligibility already checked by the view.
+        Unpaid: cancel pending payments, no Razorpay refund.
+        Paid: create Refund after DB cancel (gateway call outside atomic block).
+        Idempotent: raises ValueError if already CANCELLED.
+        """
+        if order.status == 'CANCELLED':
+            raise ValueError('Order is already cancelled.')
+
+        if allow_admin:
+            if not order.is_admin_cancellable():
+                raise ValueError('This order cannot be cancelled (delivered or already cancelled).')
+        else:
+            if not order.is_customer_cancellable():
+                raise ValueError('This order can no longer be cancelled.')
+
+        reason = (reason or '').strip()[:2000]
+        paid_payment = (
+            Payment.objects.filter(order=order, status__in=['paid', 'refund_pending', 'partially_refunded'])
+            .order_by('-created_at')
+            .first()
+        )
+
+        with transaction.atomic():
+            order.status = 'CANCELLED'
+            order.cancellation_reason = reason
+            order.cancelled_by = actor
+            order.cancelled_at = timezone.now()
+            order.save(update_fields=[
+                'status', 'cancellation_reason', 'cancelled_by', 'cancelled_at', 'updated_at',
+            ])
+            OrderStatusHistory.objects.create(
+                order=order,
+                status='CANCELLED',
+                message=reason or f'Order cancelled by {initiated_by_type}.',
+                changed_by=actor,
+            )
+            # Cancel open unpaid payment attempts.
+            for prior in Payment.objects.filter(order=order, status__in=['created', 'pending', 'authorized']):
+                prior.status = 'cancelled'
+                prior.save(update_fields=['status', 'updated_at'])
+
+        try:
+            send_order_cancellation_email(order, reason=reason)
+        except Exception:
+            pass
+
+        # Inventory: unpaid → release reservation; paid → restore sold units (idempotent).
+        try:
+            if paid_payment:
+                inventory_service.restore(order.id, user=actor)
+            else:
+                inventory_service.release(order.id, user=actor)
+        except Exception:
+            pass
+
+        refund = None
+        if paid_payment:
+            refund = PaymentService.create_refund(
+                paid_payment,
+                amount=paid_payment.amount,
+                reason=reason or 'Order cancelled',
+                initiated_by=actor,
+                initiated_by_type=initiated_by_type,
+            )
+
+        order.refresh_from_db()
+        return order, refund
+
 
 
 class PaymentCreateView(APIView):
@@ -147,56 +564,73 @@ class PaymentCreateView(APIView):
 
         subtotal = sum((item['unit_price'] * item['quantity'] for item in order_items), Decimal('0')).quantize(Decimal('0.01'))
 
-        if not settings.PAYMENT_ENABLED:
-            return Response({'detail': 'Payments are currently disabled.'}, status=status.HTTP_400_BAD_REQUEST)
+        # When PAYMENT_ENABLED is false we still create a local gateway order so tests/dev work.
+        # Live Razorpay is used only when enabled and real keys are configured.
 
-        order = Order.objects.create(
-            user=request.user,
-            order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S')}-{request.user.id}",
-            customer_name=request.data['customer_name'].strip(),
-            customer_email=request.data['customer_email'].strip(),
-            customer_mobile=request.data['customer_mobile'].strip(),
-            shipping_address=request.data['shipping_address'].strip(),
-            shipping_address_2=(request.data.get('shipping_address_2') or '').strip(),
-            city=request.data['city'].strip(),
-            state=request.data['state'].strip(),
-            postal_code=request.data['postal_code'].strip(),
-            country=request.data['country'].strip(),
-            subtotal_amount=subtotal,
-            delivery_fee=Decimal('0'),
-            tax_amount=Decimal('0'),
-            total_amount=subtotal,
-            notes=(request.data.get('notes') or '').strip(),
-            status='PENDING',
-            payment_status='pending',
-        )
-
-        for item in order_items:
-            product = item['product']
-            OrderItem.objects.create(
-                order=order,
-                product=product,
-                product_name=product.name,
-                product_image=product.main_image,
-                unit_price=item['unit_price'],
-                quantity=item['quantity'],
-                subtotal=(item['unit_price'] * item['quantity']).quantize(Decimal('0.01')),
+        with transaction.atomic():
+            order = Order.objects.create(
+                user=request.user,
+                order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S')}-{request.user.id}",
+                customer_name=request.data['customer_name'].strip(),
+                customer_email=request.data['customer_email'].strip(),
+                customer_mobile=request.data['customer_mobile'].strip(),
+                shipping_address=request.data['shipping_address'].strip(),
+                shipping_address_2=(request.data.get('shipping_address_2') or '').strip(),
+                city=request.data['city'].strip(),
+                state=request.data['state'].strip(),
+                postal_code=request.data['postal_code'].strip(),
+                country=request.data['country'].strip(),
+                subtotal_amount=subtotal,
+                delivery_fee=Decimal('0'),
+                tax_amount=Decimal('0'),
+                total_amount=subtotal,
+                notes=(request.data.get('notes') or '').strip(),
+                status='PENDING',
+                payment_status='pending',
             )
 
-        order_number = f"order_{order.id}_{int(timezone.now().timestamp())}"
-        payment = Payment.objects.create(
-            order=order,
-            user=request.user,
-            gateway='razorpay',
-            gateway_order_id=order_number,
-            amount=subtotal,
-            currency=settings.RAZORPAY_CURRENCY,
-            status='created',
-        )
+            for item in order_items:
+                product = item['product']
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    product_name=product.name,
+                    product_image=product.main_image,
+                    unit_price=item['unit_price'],
+                    quantity=item['quantity'],
+                    subtotal=(item['unit_price'] * item['quantity']).quantize(Decimal('0.01')),
+                )
+
+            try:
+                inventory_service.reserve_order(order, user=request.user)
+            except InsufficientStock as exc:
+                transaction.set_rollback(True)
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+            amount_paise = PaymentService.amount_paise(subtotal)
+            try:
+                gateway_order_id = PaymentService.create_razorpay_order(
+                    amount_paise=amount_paise,
+                    receipt=f"pb{order.id}",
+                    notes={'order_id': str(order.id), 'order_number': order.order_number},
+                )
+            except Exception as exc:
+                transaction.set_rollback(True)
+                return Response({'detail': f'Unable to create payment order: {exc}'}, status=status.HTTP_502_BAD_GATEWAY)
+
+            payment = Payment.objects.create(
+                order=order,
+                user=request.user,
+                gateway='razorpay',
+                gateway_order_id=gateway_order_id,
+                amount=subtotal,
+                currency=settings.RAZORPAY_CURRENCY,
+                status='created',
+            )
 
         return Response({
             'payment_order_id': payment.gateway_order_id,
-            'amount': int((payment.amount * 100).quantize(Decimal('1'))),
+            'amount': amount_paise,
             'currency': payment.currency,
             'gateway': payment.gateway,
             'key_id': settings.RAZORPAY_KEY_ID,
@@ -220,41 +654,54 @@ class PaymentVerifyView(APIView):
         if not payment:
             return Response({'detail': 'Payment order not found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        if payment.order_id and payment.order.user_id != request.user.id and not request.user.is_staff:
+            return Response({'detail': 'You are not allowed to verify this payment.'}, status=status.HTTP_403_FORBIDDEN)
+
         if not PaymentService.verify_signature(order_id, payment_id, signature, settings.RAZORPAY_KEY_SECRET):
-            payment.status = 'failed'
-            payment.failure_reason = 'Invalid gateway signature.'
-            payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
+            if payment.status != 'paid':
+                payment.status = 'failed'
+                payment.failure_reason = 'Invalid gateway signature.'
+                payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
             return Response({'detail': 'Payment verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        expected_amount = int((payment.amount * 100).quantize(Decimal('1')))
-        if not request.data.get('amount'):
+        expected_amount = PaymentService.amount_paise(payment.amount)
+        raw_amount = request.data.get('amount', None)
+        if raw_amount is None or raw_amount == '':
             request_amount = expected_amount
         else:
-            request_amount = int(request.data.get('amount'))
+            try:
+                request_amount = int(raw_amount)
+            except (TypeError, ValueError):
+                return Response({'detail': 'Payment amount verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
         if request_amount != expected_amount:
-            payment.status = 'failed'
-            payment.failure_reason = 'Gateway amount mismatch.'
-            payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
+            if payment.status != 'paid':
+                payment.status = 'failed'
+                payment.failure_reason = 'Gateway amount mismatch.'
+                payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
             return Response({'detail': 'Payment amount verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        payment.gateway_payment_id = payment_id
-        payment.gateway_signature = signature
-        payment.payment_method = request.data.get('payment_method', 'razorpay')
-        payment.status = 'paid'
-        payment.paid_at = timezone.now()
-        payment.save(update_fields=['gateway_payment_id', 'gateway_signature', 'payment_method', 'status', 'paid_at', 'updated_at'])
+        # Idempotent success for duplicate verify of an already-paid payment.
+        if payment.status == 'paid':
+            if payment.gateway_payment_id and payment.gateway_payment_id != payment_id:
+                return Response({'detail': 'Payment already settled with a different gateway payment id.'}, status=status.HTTP_400_BAD_REQUEST)
+            order = payment.order
+            return Response({
+                'status': 'paid',
+                'message': 'Payment already verified.',
+                'order_id': order.id if order else None,
+                'payment_id': payment.gateway_payment_id or payment_id,
+                'gateway': payment.gateway,
+            }, status=status.HTTP_200_OK)
 
+        PaymentService.mark_payment_paid(
+            payment,
+            gateway_payment_id=payment_id,
+            signature=signature,
+            source='verify',
+            changed_by=request.user,
+            payment_method=request.data.get('payment_method', 'razorpay'),
+        )
         order = payment.order
-        if order:
-            order.payment_status = 'paid'
-            order.status = 'ORDER_CONFIRMED'
-            order.save(update_fields=['payment_status', 'status', 'updated_at'])
-            OrderStatusHistory.objects.create(
-                order=order,
-                status='ORDER_CONFIRMED',
-                message='Payment verified successfully and order confirmed.',
-                changed_by=request.user,
-            )
 
         return Response({
             'status': 'paid',
@@ -270,18 +717,41 @@ class PaymentWebhookView(APIView):
     permission_classes = []
 
     def post(self, request):
-        payload = request.data
+        # Read raw body first (before request.data) so HMAC matches the provider payload.
         signature = request.headers.get('X-Razorpay-Signature', '')
-        body = request.body.decode('utf-8') if hasattr(request.body, 'decode') else str(request.body)
+        try:
+            body_bytes = request.body
+            body = body_bytes.decode('utf-8') if isinstance(body_bytes, (bytes, bytearray)) else str(body_bytes)
+        except RawPostDataException:
+            body = ''
         expected = hmac.new(settings.RAZORPAY_WEBHOOK_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
+        if not body or not hmac.compare_digest(expected, signature or ''):
             return Response({'detail': 'Invalid webhook signature.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        try:
+            payload = json.loads(body) if body else (request.data or {})
+        except ValueError:
+            payload = request.data
         event = payload.get('event')
         payment_data = payload.get('payload', {}).get('payment', {}).get('entity') or {}
         order_data = payload.get('payload', {}).get('order', {}).get('entity') or {}
         gateway_order_id = order_data.get('id') or payment_data.get('order_id') or ''
         payment_id = payment_data.get('id') or ''
+
+        if event in ('refund.processed', 'refund.failed', 'payment.refunded'):
+            refund_entity = payload.get('payload', {}).get('refund', {}).get('entity') or {}
+            if not refund_entity and payment_data:
+                refund_entity = {
+                    'id': '',
+                    'payment_id': payment_data.get('id') or '',
+                    'amount': payment_data.get('amount_refunded') or payment_data.get('amount'),
+                    'status': payment_data.get('status'),
+                }
+            synced = PaymentService.sync_refund_from_webhook(refund_entity, event)
+            if synced is None:
+                return Response({'detail': 'Refund record not found for webhook.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'status': 'ok'}, status=status.HTTP_200_OK)
+
         if not gateway_order_id and not payment_id:
             return Response({'detail': 'Webhook payload missing payment references.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -291,15 +761,29 @@ class PaymentWebhookView(APIView):
         if payment is None:
             return Response({'detail': 'Payment record not found for webhook.'}, status=status.HTTP_404_NOT_FOUND)
 
-        if event == 'payment.captured':
-            payment.status = 'paid'
-            payment.gateway_payment_id = payment_id or payment.gateway_payment_id
-            payment.paid_at = timezone.now()
-            payment.save(update_fields=['status', 'gateway_payment_id', 'paid_at', 'updated_at'])
-            if payment.order:
-                payment.order.payment_status = 'paid'
-                payment.order.status = 'ORDER_CONFIRMED'
-                payment.order.save(update_fields=['payment_status', 'status', 'updated_at'])
+        if event in ('payment.captured', 'payment.authorized'):
+            PaymentService.mark_payment_paid(
+                payment,
+                gateway_payment_id=payment_id or payment.gateway_payment_id,
+                signature=None,
+                source='webhook',
+                changed_by=None,
+                payment_method=payment_data.get('method') or payment.payment_method or 'razorpay',
+            )
+        elif event == 'payment.failed':
+            if payment.status not in ('paid', 'refund_pending', 'refunded', 'partially_refunded'):
+                payment.status = 'failed'
+                payment.gateway_payment_id = payment_id or payment.gateway_payment_id
+                payment.failure_reason = (
+                    payment_data.get('error_description')
+                    or payment_data.get('error_reason')
+                    or 'Payment failed at gateway.'
+                )
+                payment.save(update_fields=['status', 'gateway_payment_id', 'failure_reason', 'updated_at'])
+                if payment.order and payment.order.payment_status != 'paid':
+                    payment.order.payment_status = 'failed'
+                    payment.order.save(update_fields=['payment_status', 'updated_at'])
+
         return Response({'status': 'ok'}, status=status.HTTP_200_OK)
 
 
@@ -337,17 +821,48 @@ class RetryPaymentView(APIView):
         if order.payment_status == 'paid':
             return Response({'detail': 'This order has already been paid.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        payment = Payment.objects.filter(order=order).order_by('-created_at').first()
-        if not payment:
+        prior_payments = Payment.objects.filter(order=order).order_by('-created_at')
+        if not prior_payments.exists():
             return Response({'detail': 'No payment record found for this order.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Cancel prior open attempts without wiping the order (leave failed/paid/refunded as-is).
+        for prior in prior_payments.filter(status__in=['created', 'pending', 'authorized']):
+            prior.status = 'cancelled'
+            prior.save(update_fields=['status', 'updated_at'])
+
+        amount = order.total_amount
+        amount_paise = PaymentService.amount_paise(amount)
+        try:
+            gateway_order_id = PaymentService.create_razorpay_order(
+                amount_paise=amount_paise,
+                receipt=f"pbr{order.id}",
+                notes={'order_id': str(order.id), 'order_number': order.order_number, 'retry': '1'},
+            )
+        except Exception as exc:
+            return Response({'detail': f'Unable to create retry payment order: {exc}'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        payment = Payment.objects.create(
+            order=order,
+            user=request.user,
+            gateway='razorpay',
+            gateway_order_id=gateway_order_id,
+            amount=amount,
+            currency=settings.RAZORPAY_CURRENCY,
+            status='created',
+        )
+
+        if order.payment_status == 'failed':
+            order.payment_status = 'pending'
+            order.save(update_fields=['payment_status', 'updated_at'])
 
         return Response({
             'order_id': order.id,
             'payment_order_id': payment.gateway_order_id,
-            'amount': int((payment.amount * 100).quantize(Decimal('1'))),
+            'amount': amount_paise,
             'currency': payment.currency,
             'gateway': payment.gateway,
             'key_id': settings.RAZORPAY_KEY_ID,
+            'payment_id': payment.id,
         }, status=status.HTTP_200_OK)
 
 
@@ -653,75 +1168,57 @@ class OrderCheckoutView(APIView):
         if not isinstance(items, list) or not items:
             return Response({'detail': 'Your cart is empty.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        for item in items:
-            if not isinstance(item, dict):
-                return Response({'detail': 'Order items must be objects.'}, status=status.HTTP_400_BAD_REQUEST)
-            product_id = item.get('id')
-            quantity = item.get('quantity', 1)
-            if product_id is None or quantity is None:
-                return Response({'detail': 'Each cart item needs an id and quantity.'}, status=status.HTTP_400_BAD_REQUEST)
-            try:
-                quantity = int(quantity)
-            except (TypeError, ValueError):
-                return Response({'detail': 'Quantity must be a number.'}, status=status.HTTP_400_BAD_REQUEST)
-            if quantity <= 0:
-                return Response({'detail': 'Quantity must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
-
         required_fields = ['customer_name', 'customer_email', 'customer_mobile', 'shipping_address', 'city', 'state', 'postal_code', 'country']
         missing = [field for field in required_fields if not str(request.data.get(field, '')).strip()]
         if missing:
             return Response({'detail': f'Missing required checkout fields: {", ".join(missing)}.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        subtotal = Decimal('0')
-        order_items = []
-        for item in items:
-            product = Product.objects.filter(id=item['id'], is_active=True).first()
-            if not product:
-                return Response({'detail': f'Product #{item["id"]} is unavailable.'}, status=status.HTTP_404_NOT_FOUND)
-            quantity = int(item.get('quantity', 1))
-            unit_price = product.discounted_price
-            line_total = (unit_price * quantity).quantize(Decimal('0.01'))
-            subtotal += line_total
-            order_items.append({
-                'product': product,
-                'product_name': product.name,
-                'product_image': product.main_image,
-                'unit_price': unit_price,
-                'quantity': quantity,
-                'subtotal': line_total,
-            })
+        try:
+            validated = PaymentService.ensure_valid_cart(items)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        order = Order.objects.create(
-            user=request.user,
-            order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S')}-{request.user.id}",
-            customer_name=request.data['customer_name'].strip(),
-            customer_email=request.data['customer_email'].strip(),
-            customer_mobile=request.data['customer_mobile'].strip(),
-            shipping_address=request.data['shipping_address'].strip(),
-            shipping_address_2=(request.data.get('shipping_address_2') or '').strip(),
-            city=request.data['city'].strip(),
-            state=request.data['state'].strip(),
-            postal_code=request.data['postal_code'].strip(),
-            country=request.data['country'].strip(),
-            subtotal_amount=subtotal,
-            delivery_fee=Decimal('0'),
-            tax_amount=Decimal('0'),
-            total_amount=subtotal,
-            notes=(request.data.get('notes') or '').strip(),
-            status='pending',
-            payment_status='pending',
-        )
+        subtotal = sum((row['unit_price'] * row['quantity'] for row in validated), Decimal('0')).quantize(Decimal('0.01'))
 
-        for item in order_items:
-            OrderItem.objects.create(
-                order=order,
-                product=item['product'],
-                product_name=item['product_name'],
-                product_image=item['product_image'],
-                unit_price=item['unit_price'],
-                quantity=item['quantity'],
-                subtotal=item['subtotal'],
+        with transaction.atomic():
+            order = Order.objects.create(
+                user=request.user,
+                order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S')}-{request.user.id}",
+                customer_name=request.data['customer_name'].strip(),
+                customer_email=request.data['customer_email'].strip(),
+                customer_mobile=request.data['customer_mobile'].strip(),
+                shipping_address=request.data['shipping_address'].strip(),
+                shipping_address_2=(request.data.get('shipping_address_2') or '').strip(),
+                city=request.data['city'].strip(),
+                state=request.data['state'].strip(),
+                postal_code=request.data['postal_code'].strip(),
+                country=request.data['country'].strip(),
+                subtotal_amount=subtotal,
+                delivery_fee=Decimal('0'),
+                tax_amount=Decimal('0'),
+                total_amount=subtotal,
+                notes=(request.data.get('notes') or '').strip(),
+                status='PENDING',
+                payment_status='pending',
             )
+
+            for row in validated:
+                product = row['product']
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    product_name=product.name,
+                    product_image=product.main_image,
+                    unit_price=row['unit_price'],
+                    quantity=row['quantity'],
+                    subtotal=(row['unit_price'] * row['quantity']).quantize(Decimal('0.01')),
+                )
+
+            try:
+                inventory_service.reserve_order(order, user=request.user)
+            except InsufficientStock as exc:
+                transaction.set_rollback(True)
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
@@ -730,10 +1227,10 @@ class OrderListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        orders = Order.objects.filter(user=request.user).order_by('-created_at')
+        orders = Order.objects.filter(user=request.user).prefetch_related('items', 'status_history', 'refunds').order_by('-created_at')
         return Response({
             'count': orders.count(),
-            'results': OrderSerializer(orders, many=True).data,
+            'results': OrderSerializer(orders, many=True, context={'request': request}).data,
         }, status=status.HTTP_200_OK)
 
 
@@ -741,22 +1238,92 @@ class OrderDetailView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, order_id):
-        order = Order.objects.filter(id=order_id).select_related('user').prefetch_related('items').first()
+        order = Order.objects.filter(id=order_id).select_related('user', 'cancelled_by').prefetch_related('items', 'status_history', 'refunds').first()
         if not order:
             return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
         if not request.user.is_staff and order.user_id != request.user.id:
             return Response({'detail': 'You are not allowed to view this order.'}, status=status.HTTP_403_FORBIDDEN)
-        return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
+        return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_200_OK)
 
 
 class AdminOrderListView(APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request):
-        orders = Order.objects.all().order_by('-created_at')
+        orders = Order.objects.all().select_related('user', 'delivery_employee').prefetch_related('items').order_by('-created_at')
+
+        status_filter = (request.query_params.get('status') or '').strip()
+        payment_status = (request.query_params.get('payment_status') or '').strip()
+        search = (request.query_params.get('search') or '').strip()
+        date_from = (request.query_params.get('date_from') or '').strip()
+        date_to = (request.query_params.get('date_to') or '').strip()
+
+        if status_filter:
+            orders = orders.filter(status=status_filter)
+        if payment_status:
+            orders = orders.filter(payment_status=payment_status)
+        if search:
+            orders = orders.filter(
+                Q(order_number__icontains=search)
+                | Q(customer_name__icontains=search)
+                | Q(customer_email__icontains=search)
+                | Q(customer_mobile__icontains=search)
+            )
+        if date_from:
+            orders = orders.filter(created_at__date__gte=date_from)
+        if date_to:
+            orders = orders.filter(created_at__date__lte=date_to)
+
         return Response({
             'count': orders.count(),
-            'results': OrderSerializer(orders, many=True).data,
+            'results': OrderSerializer(orders, many=True, context={'request': request}).data,
+        }, status=status.HTTP_200_OK)
+
+
+class AdminPaymentListView(APIView):
+    """List payments for admins without exposing gateway secrets/signatures."""
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        payments = Payment.objects.select_related('order', 'user').order_by('-created_at')
+        status_filter = (request.query_params.get('status') or '').strip()
+        search = (request.query_params.get('search') or '').strip()
+        if status_filter:
+            payments = payments.filter(status=status_filter)
+        if search:
+            payments = payments.filter(
+                Q(gateway_order_id__icontains=search)
+                | Q(gateway_payment_id__icontains=search)
+                | Q(order__order_number__icontains=search)
+                | Q(order__customer_name__icontains=search)
+                | Q(user__username__icontains=search)
+                | Q(user__email__icontains=search)
+            )
+
+        results = []
+        for payment in payments[:500]:
+            order = payment.order
+            results.append({
+                'id': payment.id,
+                'order_id': order.id if order else None,
+                'order_number': order.order_number if order else None,
+                'customer_name': order.customer_name if order else (payment.user.get_full_name() or payment.user.username),
+                'customer_email': order.customer_email if order else payment.user.email,
+                'amount': str(payment.amount),
+                'currency': payment.currency,
+                'status': payment.status,
+                'gateway': payment.gateway,
+                'gateway_order_id': payment.gateway_order_id,
+                'gateway_payment_id': payment.gateway_payment_id,
+                'payment_method': payment.payment_method,
+                'failure_reason': payment.failure_reason,
+                'created_at': payment.created_at,
+                'paid_at': payment.paid_at,
+            })
+
+        return Response({
+            'count': len(results),
+            'results': results,
         }, status=status.HTTP_200_OK)
 
 
@@ -995,8 +1562,8 @@ class AdminReportRevenueView(APIView):
             sales['total_orders'] = Order.objects.count()
             sales['total_sales'] = float(Order.objects.aggregate(total=Sum('total_amount'))['total'] or 0)
             sales['average_order_value'] = float(Order.objects.aggregate(avg=Avg('total_amount'))['avg'] or 0)
-            sales['pending_orders'] = Order.objects.filter(status='pending').count()
-            sales['completed_orders'] = Order.objects.filter(status='delivered').count()
+            sales['pending_orders'] = Order.objects.filter(status='PENDING').count()
+            sales['completed_orders'] = Order.objects.filter(status='DELIVERED').count()
             sales['note'] = 'Live order totals are available.'
         return Response(sales, status=status.HTTP_200_OK)
 
@@ -1026,3 +1593,258 @@ class AdminReportActivityView(APIView):
         from_date = request.query_params.get('from')
         to_date = request.query_params.get('to')
         return Response(AdminReportingService.admin_activity(from_date, to_date, preset), status=status.HTTP_200_OK)
+
+
+class OrderCancelView(APIView):
+    """Customer cancel: POST /api/orders/<id>/cancel/"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, order_id):
+        order = Order.objects.filter(id=order_id).first()
+        if not order:
+            return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if order.user_id != request.user.id:
+            return Response({'detail': 'You are not allowed to cancel this order.'}, status=status.HTTP_403_FORBIDDEN)
+        if order.status == 'CANCELLED':
+            return Response({'detail': 'Order is already cancelled.'}, status=status.HTTP_409_CONFLICT)
+
+        reason = (request.data.get('reason') or '').strip()
+        try:
+            order, refund = PaymentService.cancel_order(
+                order,
+                actor=request.user,
+                reason=reason,
+                initiated_by_type='customer',
+                allow_admin=False,
+            )
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = OrderSerializer(order, context={'request': request}).data
+        if refund is not None:
+            payload['refund'] = RefundSerializer(refund).data
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class AdminOrderCancelView(APIView):
+    """Admin cancel: POST /api/admin/orders/<id>/cancel/"""
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, order_id):
+        order = Order.objects.filter(id=order_id).first()
+        if not order:
+            return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if order.status == 'CANCELLED':
+            return Response({'detail': 'Order is already cancelled.'}, status=status.HTTP_409_CONFLICT)
+
+        reason = (request.data.get('reason') or '').strip()
+        try:
+            order, refund = PaymentService.cancel_order(
+                order,
+                actor=request.user,
+                reason=reason,
+                initiated_by_type='admin',
+                allow_admin=True,
+            )
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = OrderSerializer(order, context={'request': request}).data
+        if refund is not None:
+            payload['refund'] = RefundSerializer(refund).data
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class AdminOrderRefundView(APIView):
+    """Admin partial/full refund without requiring cancel: POST /api/admin/orders/<id>/refund/"""
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, order_id):
+        order = Order.objects.filter(id=order_id).first()
+        if not order:
+            return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        payment = (
+            Payment.objects.filter(order=order, status__in=['paid', 'refund_pending', 'partially_refunded'])
+            .order_by('-created_at')
+            .first()
+        )
+        if not payment:
+            return Response({'detail': 'No refundable paid payment found for this order.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_amount = request.data.get('amount', None)
+        reason = (request.data.get('reason') or '').strip()
+        amount = None
+        if raw_amount is not None and raw_amount != '':
+            try:
+                amount = Decimal(str(raw_amount)).quantize(Decimal('0.01'))
+            except Exception:
+                return Response({'detail': 'Invalid refund amount.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            refund = PaymentService.create_refund(
+                payment,
+                amount=amount,
+                reason=reason or 'Admin refund',
+                initiated_by=request.user,
+                initiated_by_type='admin',
+            )
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'order': OrderSerializer(order, context={'request': request}).data,
+            'refund': RefundSerializer(refund).data,
+        }, status=status.HTTP_200_OK)
+
+
+class AdminRefundListView(APIView):
+    """Minimal admin refund list: GET /api/admin/refunds/"""
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        refunds = Refund.objects.select_related('order', 'payment', 'user').order_by('-created_at')
+        status_filter = (request.query_params.get('status') or '').strip()
+        if status_filter:
+            refunds = refunds.filter(status=status_filter)
+        order_id = (request.query_params.get('order_id') or '').strip()
+        if order_id:
+            refunds = refunds.filter(order_id=order_id)
+        return Response({
+            'count': refunds.count(),
+            'results': RefundSerializer(refunds[:200], many=True).data,
+        }, status=status.HTTP_200_OK)
+
+
+class CartValidateView(APIView):
+    """Validate cart quantities against live available stock (FE cart is client-side)."""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        items = request.data.get('items') or []
+        if not isinstance(items, list) or not items:
+            return Response({'detail': 'Your cart is empty.', 'valid': False, 'items': []}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            results, errors = inventory_service.validate_cart_items(items)
+        except InventoryError as exc:
+            return Response({'detail': str(exc), 'valid': False, 'items': []}, status=status.HTTP_400_BAD_REQUEST)
+        valid = not errors
+        payload = {
+            'valid': valid,
+            'items': results,
+            'detail': errors[0] if errors else 'Cart quantities are available.',
+        }
+        return Response(payload, status=status.HTTP_200_OK if valid else status.HTTP_400_BAD_REQUEST)
+
+
+class AdminInventoryListView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        qs = Product.objects.all().order_by('name')
+        availability = (request.query_params.get('availability') or '').strip()
+        search = (request.query_params.get('search') or '').strip()
+        status_filter = (request.query_params.get('status') or '').strip()
+        if availability:
+            qs = qs.filter(availability=availability)
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        if search:
+            qs = qs.filter(Q(name__icontains=search) | Q(category__icontains=search))
+        data = ProductSerializer(qs, many=True, context={'request': request}).data
+        return Response({'count': qs.count(), 'results': data}, status=status.HTTP_200_OK)
+
+
+class AdminInventoryDetailView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, product_id):
+        product = Product.objects.filter(id=product_id).first()
+        if not product:
+            return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ProductSerializer(product, context={'request': request}).data, status=status.HTTP_200_OK)
+
+
+class AdminInventoryAdjustView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, product_id):
+        product = Product.objects.filter(id=product_id).first()
+        if not product:
+            return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        action = (request.data.get('action') or 'adjust').strip().lower()
+        reason = (request.data.get('reason') or '').strip()
+        threshold = request.data.get('low_stock_threshold', None)
+        try:
+            quantity = int(request.data.get('quantity', 0))
+        except (TypeError, ValueError):
+            return Response({'detail': 'quantity must be an integer.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if threshold is not None:
+            try:
+                threshold = int(threshold)
+            except (TypeError, ValueError):
+                return Response({'detail': 'low_stock_threshold must be an integer.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            product = inventory_service.adjust(
+                product,
+                action=action,
+                quantity=quantity,
+                reason=reason,
+                admin=request.user,
+                low_stock_threshold=threshold,
+            )
+        except InventoryError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        AdminActivity.objects.create(
+            admin_user=request.user,
+            action='inventory_adjust',
+            entity_type='product',
+            entity_id=product.id,
+            description=f'Inventory {action} qty={quantity}: {reason}'[:500],
+            ip_address=request.META.get('REMOTE_ADDR'),
+        )
+        return Response(ProductSerializer(product, context={'request': request}).data, status=status.HTTP_200_OK)
+
+
+class AdminInventoryHistoryView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, product_id):
+        product = Product.objects.filter(id=product_id).first()
+        if not product:
+            return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
+        txns = InventoryTransaction.objects.filter(product=product).select_related('performed_by').order_by('-created_at')[:200]
+        results = [
+            {
+                'id': t.id,
+                'product_id': t.product_id,
+                'quantity_change': t.quantity_change,
+                'previous_quantity': t.previous_quantity,
+                'new_quantity': t.new_quantity,
+                'adjustment_type': t.adjustment_type,
+                'reason': t.reason,
+                'reference_type': t.reference_type,
+                'reference_id': t.reference_id,
+                'performed_by': t.performed_by_id,
+                'performed_by_username': t.performed_by.username if t.performed_by else None,
+                'created_at': t.created_at,
+            }
+            for t in txns
+        ]
+        return Response({'count': len(results), 'results': results}, status=status.HTTP_200_OK)
+
+
+class AdminInventoryLowStockView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        qs = Product.objects.filter(
+            Q(availability='low_stock') | Q(availability='out_of_stock') | Q(available_quantity__lte=F('low_stock_threshold'))
+        ).order_by('available_quantity', 'name')
+        data = ProductSerializer(qs, many=True, context={'request': request}).data
+        return Response({'count': qs.count(), 'results': data}, status=status.HTTP_200_OK)
+

@@ -1,10 +1,10 @@
 from datetime import datetime, timedelta
 
 from django.contrib.auth.models import User
-from django.db.models import Avg, Count, Q
+from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
 
-from .models import AdminActivity, Product, ProductView, Review
+from .models import AdminActivity, Order, Payment, Product, ProductView, Refund, Review
 
 
 class AdminReportingService:
@@ -85,6 +85,9 @@ class AdminReportingService:
         discounted = Product.objects.filter(discount__gt=0).count()
         no_image = Product.objects.filter(Q(main_image='') | Q(main_image__isnull=True)).count()
         with_3d = Product.objects.exclude(three_d_model='').exclude(three_d_model__isnull=True).count()
+        in_stock = Product.objects.filter(availability='in_stock').count()
+        low_stock = Product.objects.filter(availability='low_stock').count()
+        out_of_stock = Product.objects.filter(availability='out_of_stock').count()
         return {
             'total_products': Product.objects.count(),
             'active_products': active,
@@ -92,6 +95,9 @@ class AdminReportingService:
             'products_with_discounts': discounted,
             'products_without_images': no_image,
             'products_with_3d_assets': with_3d,
+            'in_stock_products': in_stock,
+            'low_stock_products': low_stock,
+            'out_of_stock_products': out_of_stock,
         }
 
     @staticmethod
@@ -114,20 +120,44 @@ class AdminReportingService:
     @staticmethod
     def sales_summary(from_date=None, to_date=None, preset='custom'):
         start, end = AdminReportingService.parse_date_range(from_date, to_date, preset)
+        payments = Payment.objects.filter(created_at__gte=start, created_at__lte=end)
+        order_queryset = Order.objects.filter(created_at__gte=start, created_at__lte=end)
+
+        total_orders = order_queryset.count()
+        # total_sales recomputed below to include paid/refund_pending/refunded/partially_refunded
+        total_sales = 0.0
+        failed_payments = payments.filter(status='failed').count()
+        pending_payments = payments.filter(status='pending').count()
+        refunded_payments = payments.filter(status__in=['refunded', 'partially_refunded']).count()
+        successful_payments = payments.filter(status__in=['paid', 'refund_pending', 'refunded', 'partially_refunded']).count()
+        # Successful capture total still based on originally paid amount (paid + refund states).
+        paid_like = payments.filter(status__in=['paid', 'refund_pending', 'refunded', 'partially_refunded'])
+        total_sales = float((paid_like.aggregate(total=Sum('amount'))['total'] or 0))
+        refunds_qs = Refund.objects.filter(status='completed', created_at__gte=start, created_at__lte=end)
+        refunds_total = float((refunds_qs.aggregate(total=Sum('amount'))['total'] or 0))
+        net_sales = total_sales - refunds_total
+
         sales = {
-            'total_orders': 0,
-            'orders_today': 0,
-            'orders_this_week': 0,
-            'orders_this_month': 0,
-            'total_sales': 0,
-            'today_sales': 0,
-            'monthly_sales': 0,
-            'average_order_value': 0,
-            'cancelled_orders': 0,
-            'pending_orders': 0,
-            'completed_orders': 0,
+            'total_orders': total_orders,
+            'orders_today': order_queryset.filter(created_at__date=timezone.now().date()).count(),
+            'orders_this_week': order_queryset.filter(created_at__gte=timezone.now() - timedelta(days=7)).count(),
+            'orders_this_month': order_queryset.filter(created_at__gte=timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)).count(),
+            'total_sales': total_sales,
+            'today_sales': float((paid_like.filter(created_at__date=timezone.now().date()).aggregate(total=Sum('amount'))['total'] or 0)),
+            'monthly_sales': float((paid_like.filter(created_at__gte=timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)).aggregate(total=Sum('amount'))['total'] or 0)),
+            'average_order_value': float((order_queryset.aggregate(avg=Avg('total_amount'))['avg'] or 0)),
+            'cancelled_orders': order_queryset.filter(status='CANCELLED').count(),
+            'pending_orders': order_queryset.filter(status='PENDING').count(),
+            'completed_orders': order_queryset.filter(status='DELIVERED').count(),
+            'successful_payments': successful_payments,
+            'failed_payments': failed_payments,
+            'pending_payments': pending_payments,
+            'refunded_payments': refunded_payments,
+            'refunds_total': refunds_total,
+            'net_sales': net_sales,
+            'transactions': payments.count(),
             'currency': 'INR',
-            'note': 'No order/payment module is active yet. Sales figures are unavailable until order data is added.',
+            'note': 'Payment and order data are now integrated into revenue reporting. net_sales = successful payments - completed refunds.',
         }
         return sales
 

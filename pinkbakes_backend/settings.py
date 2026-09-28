@@ -26,11 +26,12 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'pinkbakes@pinkbakes.c
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 
 PAYMENT_GATEWAY = os.environ.get('PAYMENT_GATEWAY', 'razorpay')
-PAYMENT_ENABLED = os.environ.get('PAYMENT_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+PAYMENT_ENABLED = os.environ.get('PAYMENT_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on')
 RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', 'rzp_test_default_key')
 RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', 'test_razorpay_secret')
 RAZORPAY_WEBHOOK_SECRET = os.environ.get('RAZORPAY_WEBHOOK_SECRET', 'test_webhook_secret')
 RAZORPAY_CURRENCY = os.environ.get('RAZORPAY_CURRENCY', 'INR')
+DEFAULT_LOW_STOCK_THRESHOLD = int(os.environ.get('DEFAULT_LOW_STOCK_THRESHOLD', '5') or 5)
 
 if EMAIL_HOST:
     EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
