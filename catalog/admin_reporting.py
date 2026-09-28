@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
 
-from .models import AdminActivity, CouponRedemption, Order, Payment, Product, ProductView, Refund, Review
+from .models import AdminActivity, CouponRedemption, Order, Payment, Product, Refund, Review
 
 
 class AdminReportingService:

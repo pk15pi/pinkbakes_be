@@ -27,6 +27,7 @@ from .admin_ops import (
     paginate_queryset,
     validate_order_status_transition,
 )
+from .constants import CATALOG_CATEGORIES, CATEGORY_FALLBACK_IMAGES
 from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
 from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
 from notifications import events as notification_events
@@ -1007,6 +1008,72 @@ class RetryPaymentView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+class CategoryListView(APIView):
+    """Public list of cake categories with published product counts and sample images.
+
+    Categories are CharField labels on Product (no separate Category model).
+    Returns canonical catalog categories that have at least one published/active
+    product, plus any extra category strings present on published products.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        published = Product.objects.filter(is_active=True, status='published')
+        counts = {}
+        images = {}
+        for row in published.values('category', 'main_image', 'images').order_by('-featured', '-created_at'):
+            name = (row.get('category') or '').strip()
+            if not name:
+                continue
+            key = name
+            # Preserve first-seen casing from canonical list when possible
+            counts[key] = counts.get(key, 0) + 1
+            if key not in images:
+                img = (row.get('main_image') or '').strip()
+                if not img:
+                    imgs = row.get('images') or []
+                    if isinstance(imgs, list) and imgs:
+                        img = str(imgs[0] or '')
+                if img:
+                    images[key] = img
+
+        # Prefer canonical order; append any unexpected category labels at the end
+        canonical_lower = {c.lower(): c for c in CATALOG_CATEGORIES}
+        ordered_names = []
+        seen_lower = set()
+        for canon in CATALOG_CATEGORIES:
+            # match case-insensitively against DB keys
+            match_key = None
+            for db_key in counts:
+                if db_key.lower() == canon.lower():
+                    match_key = db_key
+                    break
+            if match_key and counts.get(match_key, 0) > 0:
+                ordered_names.append(canon)
+                seen_lower.add(canon.lower())
+        for db_key, count in sorted(counts.items(), key=lambda x: x[0].lower()):
+            if db_key.lower() not in seen_lower and count > 0:
+                ordered_names.append(db_key)
+                seen_lower.add(db_key.lower())
+
+        payload = []
+        for name in ordered_names:
+            # resolve count via case-insensitive lookup
+            count = 0
+            sample = ''
+            for db_key, c in counts.items():
+                if db_key.lower() == name.lower():
+                    count = c
+                    sample = images.get(db_key) or ''
+                    break
+            payload.append({
+                'name': name,
+                'product_count': count,
+                'image': sample or CATEGORY_FALLBACK_IMAGES.get(name, CATEGORY_FALLBACK_IMAGES.get(canonical_lower.get(name.lower(), ''), '')),
+            })
+        return Response(payload)
+
+
 class ProductListView(generics.ListAPIView):
     serializer_class = ProductSerializer
     permission_classes = [permissions.AllowAny]
@@ -1020,6 +1087,25 @@ class ProductListView(generics.ListAPIView):
         if search:
             queryset = queryset.filter(Q(name__icontains=search) | Q(short_description__icontains=search))
         return queryset.order_by('-featured', '-created_at')
+
+
+class ProductSlugDetailView(generics.RetrieveAPIView):
+    """Public product detail by slug (for SEO deep links)."""
+    queryset = Product.objects.filter(is_active=True, status='published')
+    serializer_class = ProductSerializer
+    permission_classes = [permissions.AllowAny]
+    lookup_field = 'slug'
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        ProductView.objects.create(
+            product=instance,
+            user=request.user if request.user.is_authenticated else None,
+            session_key=request.session.session_key or '',
+            ip_address=request.META.get('REMOTE_ADDR'),
+        )
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
 
 
 class ProductDetailView(generics.RetrieveAPIView):
@@ -1242,7 +1328,16 @@ class AdminReviewListView(APIView):
         product_id = request.query_params.get('product_id')
         if product_id:
             queryset = queryset.filter(product_id=product_id)
-        return Response(ReviewSerializer(queryset, many=True).data, status=status.HTTP_200_OK)
+        search = (request.query_params.get('search') or '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(comment__icontains=search)
+                | Q(name__icontains=search)
+                | Q(user__username__icontains=search)
+                | Q(product__name__icontains=search)
+            )
+        rows, meta = paginate_queryset(queryset, request)
+        return Response({**meta, 'results': ReviewSerializer(rows, many=True).data}, status=status.HTTP_200_OK)
 
 
 class AdminReviewDetailView(APIView):
@@ -2052,6 +2147,11 @@ class AdminOrderRefundView(APIView):
         except ValueError as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        log_admin_activity(
+            request.user, 'refund', entity_type='refund', entity_id=refund.id,
+            description=f'Admin refund {refund.amount} on order {order.order_number}',
+            request=request,
+        )
         return Response({
             'order': OrderSerializer(order, context={'request': request}).data,
             'refund': RefundSerializer(refund).data,

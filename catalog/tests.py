@@ -8,7 +8,7 @@ from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from .models import Coupon, CouponRedemption, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review
+from .models import Coupon, CouponRedemption, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review, AdminActivity, Employee
 from . import inventory as inventory_service
 
 
@@ -1067,6 +1067,63 @@ class InventoryAPITests(TestCase):
         self.assertIn('out_of_stock_products', product_stats)
 
 
+
+class CategoryCatalogApiTests(TestCase):
+    def setUp(self):
+        self.birthday = Product.objects.create(
+            name='API Birthday Cake',
+            category='Birthday Cakes',
+            price=Decimal('999.00'),
+            status='published',
+            is_active=True,
+            main_image='https://images.unsplash.com/photo-1563729784474-d77dbb933a9e?auto=format&fit=crop&w=1000&q=85',
+        )
+        self.chocolate = Product.objects.create(
+            name='API Chocolate Cake',
+            category='Chocolate Cakes',
+            price=Decimal('1199.00'),
+            status='published',
+            is_active=True,
+            main_image='https://images.unsplash.com/photo-1578985545062-69928b1d9587?auto=format&fit=crop&w=1000&q=85',
+        )
+        Product.objects.create(
+            name='Draft Hidden Cake',
+            category='Wedding Cakes',
+            price=Decimal('2000.00'),
+            status='draft',
+            is_active=True,
+        )
+
+    def test_categories_lists_only_published_with_counts(self):
+        response = self.client.get('/api/catalog/categories/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        by_name = {row['name']: row for row in data}
+        self.assertIn('Birthday Cakes', by_name)
+        self.assertIn('Chocolate Cakes', by_name)
+        self.assertNotIn('Wedding Cakes', by_name)  # draft only
+        self.assertGreaterEqual(by_name['Birthday Cakes']['product_count'], 1)
+        self.assertTrue(by_name['Birthday Cakes']['image'])
+
+    def test_product_list_filters_by_category(self):
+        response = self.client.get('/api/catalog/products/', {'category': 'Chocolate Cakes'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(len(data) >= 1)
+        self.assertTrue(all(p['category'].lower() == 'chocolate cakes' for p in data))
+        names = {p['name'] for p in data}
+        self.assertIn('API Chocolate Cake', names)
+        self.assertNotIn('API Birthday Cake', names)
+
+    def test_product_list_all_cakes_ignores_category_sentinel(self):
+        response = self.client.get('/api/catalog/products/', {'category': 'All Cakes'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        cats = {p['category'] for p in data}
+        self.assertIn('Birthday Cakes', cats)
+        self.assertIn('Chocolate Cakes', cats)
+
+
 class InventoryConcurrencyTests(TransactionTestCase):
     def setUp(self):
         self.product = Product.objects.create(
@@ -1821,3 +1878,233 @@ class AddressDeliveryAPITests(TestCase):
         self.assertEqual(settings_patch.status_code, status.HTTP_200_OK)
         self.assertEqual(float(settings_patch.json()['per_km_charge']), 5.0)
 
+
+
+class AdminOpsControlCenterTests(TestCase):
+    """Authz + dashboard + status transitions + customers + settings for admin control center."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(
+            username='ops_admin', password='securepass123', is_staff=True, is_superuser=True,
+        )
+        self.customer = User.objects.create_user(
+            username='ops_customer', email='ops_customer@example.com', password='securepass123',
+        )
+        self.delivery_user = User.objects.create_user(
+            username='ops_delivery', email='ops_delivery@example.com', password='securepass123', is_staff=False,
+        )
+        self.employee = Employee.objects.create(
+            user=self.delivery_user,
+            employee_id='EMP-OPS-1',
+            name='Ops Rider',
+            contact_number='9000000001',
+            status='AVAILABLE',
+        )
+        self.product = Product.objects.create(
+            name='Ops Cake', price=500, discount=0, available_quantity=20, category='Birthday Cakes',
+        )
+
+    def _make_order(self, user=None, status='ORDER_CONFIRMED', payment_status='paid'):
+        user = user or self.customer
+        return Order.objects.create(
+            user=user,
+            order_number=f'OPS-{Order.objects.count()+1:04d}',
+            customer_name=user.username,
+            customer_email=user.email or f'{user.username}@example.com',
+            customer_mobile='9876543210',
+            shipping_address='1 Test St',
+            city='Kolkata',
+            state='WB',
+            postal_code='700001',
+            country='India',
+            subtotal_amount=500,
+            total_amount=500,
+            status=status,
+            payment_status=payment_status,
+        )
+
+    def test_customer_blocked_from_admin_dashboard(self):
+        self.client.force_authenticate(user=self.customer)
+        for url in [
+            '/api/admin/dashboard/',
+            '/api/admin/customers/',
+            '/api/admin/settings/status/',
+            '/api/admin/orders/',
+            '/api/admin/payments/',
+            '/api/admin/refunds/',
+            '/api/admin/deliveries/active/',
+            '/api/admin/exports/orders/',
+        ]:
+            resp = self.client.get(url)
+            self.assertIn(resp.status_code, (401, 403), msg=f'{url} -> {resp.status_code}')
+
+    def test_delivery_employee_blocked_from_unrestricted_admin(self):
+        self.client.force_authenticate(user=self.delivery_user)
+        for url in [
+            '/api/admin/dashboard/',
+            '/api/admin/customers/',
+            '/api/admin/orders/',
+            '/api/admin/inventory/',
+            '/api/admin/coupons/',
+            '/api/admin/reviews/',
+        ]:
+            resp = self.client.get(url)
+            self.assertIn(resp.status_code, (401, 403), msg=f'{url} -> {resp.status_code}')
+
+    def test_unauthenticated_rejected(self):
+        resp = self.client.get('/api/admin/dashboard/')
+        self.assertIn(resp.status_code, (401, 403))
+        resp = self.client.get('/api/admin/customers/')
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_admin_allowed_dashboard_and_metrics(self):
+        self.client.force_authenticate(user=self.admin)
+        self._make_order(status='PREPARING')
+        self._make_order(status='OUT_FOR_DELIVERY')
+        resp = self.client.get('/api/admin/dashboard/?preset=today')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn('orders', data)
+        self.assertIn('payments', data)
+        self.assertIn('products', data)
+        self.assertIn('customers', data)
+        self.assertIn('reviews', data)
+        self.assertIn('coupons', data)
+        self.assertIn('delivery', data)
+        self.assertIn('sales_summary', data)
+        self.assertIn('gross_sales', data['sales_summary'])
+        self.assertIn('net_sales', data['sales_summary'])
+        self.assertGreaterEqual(data['orders']['preparing'], 1)
+        self.assertGreaterEqual(data['orders']['out_for_delivery'], 1)
+
+    def test_order_status_valid_and_invalid_transition(self):
+        order = self._make_order(status='ORDER_CONFIRMED')
+        self.client.force_authenticate(user=self.admin)
+        bad = self.client.patch(f'/api/admin/orders/{order.id}/status/', {'status': 'DELIVERED'}, format='json')
+        self.assertEqual(bad.status_code, 400)
+        good = self.client.patch(f'/api/admin/orders/{order.id}/status/', {'status': 'PREPARING'}, format='json')
+        self.assertEqual(good.status_code, 200)
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'PREPARING')
+        self.assertTrue(AdminActivity.objects.filter(action='order_status', entity_id=order.id).exists())
+        # Cancel via status update rejected
+        cancel_via_status = self.client.patch(
+            f'/api/admin/orders/{order.id}/status/', {'status': 'CANCELLED'}, format='json',
+        )
+        self.assertEqual(cancel_via_status.status_code, 400)
+
+    def test_orders_search_filter_pagination(self):
+        self._make_order(status='ORDER_CONFIRMED')
+        self._make_order(status='PREPARING')
+        self.client.force_authenticate(user=self.admin)
+        listed = self.client.get('/api/admin/orders/?status=PREPARING&page=1&page_size=10')
+        self.assertEqual(listed.status_code, 200)
+        body = listed.json()
+        self.assertIn('results', body)
+        self.assertIn('page', body)
+        self.assertTrue(all(r['status'] == 'PREPARING' for r in body['results']))
+        search = self.client.get('/api/admin/orders/?search=ops_customer')
+        self.assertEqual(search.status_code, 200)
+        self.assertGreaterEqual(search.json()['count'], 1)
+        detail = self.client.get(f'/api/admin/orders/{Order.objects.first().id}/')
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn('payments', detail.json())
+        self.assertIn('status_history', detail.json())
+
+    def test_customers_search_and_activate(self):
+        self.client.force_authenticate(user=self.admin)
+        listed = self.client.get('/api/admin/customers/?search=ops_customer')
+        self.assertEqual(listed.status_code, 200)
+        self.assertGreaterEqual(listed.json()['count'], 1)
+        detail = self.client.get(f'/api/admin/customers/{self.customer.id}/')
+        self.assertEqual(detail.status_code, 200)
+        self.assertNotIn('password', detail.json())
+        deactivate = self.client.patch(
+            f'/api/admin/customers/{self.customer.id}/', {'is_active': False}, format='json',
+        )
+        self.assertEqual(deactivate.status_code, 200)
+        self.customer.refresh_from_db()
+        self.assertFalse(self.customer.is_active)
+        elevate = self.client.patch(
+            f'/api/admin/customers/{self.customer.id}/', {'is_staff': True}, format='json',
+        )
+        self.assertEqual(elevate.status_code, 400)
+        self.customer.refresh_from_db()
+        self.assertFalse(self.customer.is_staff)
+
+    def test_settings_status_never_exposes_secrets(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.get('/api/admin/settings/status/')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        dumped = str(body).lower()
+        self.assertIn('integrations', body)
+        self.assertIn('smtp_configured', body['integrations'])
+        self.assertIn('sms_configured', body['integrations'])
+        self.assertIn('whatsapp_configured', body['integrations'])
+        self.assertIn('payment_configured', body['integrations'])
+        for banned in ['password', 'secret', 'auth_token', 'webhook_secret', 'twilio_auth_token']:
+            self.assertNotIn(banned, dumped)
+        # Reject secret writes
+        bad = self.client.patch('/api/admin/settings/status/', {'EMAIL_HOST_PASSWORD': 'x'}, format='json')
+        self.assertEqual(bad.status_code, 400)
+        # Allow bakery location update
+        ok = self.client.patch(
+            '/api/admin/settings/status/',
+            {'bakery_latitude': '22.572600', 'bakery_longitude': '88.363900'},
+            format='json',
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_reviews_approve_reject_audit_and_public_visibility(self):
+        review = Review.objects.create(
+            product=self.product, user=self.customer, name='Ops', rating=5,
+            comment='Nice', status='pending',
+        )
+        self.client.force_authenticate(user=self.admin)
+        approve = self.client.post(f'/api/admin/reviews/{review.id}/approve/', {}, format='json')
+        self.assertEqual(approve.status_code, 200)
+        review.refresh_from_db()
+        self.assertEqual(review.status, 'approved')
+        self.assertTrue(AdminActivity.objects.filter(action='review_moderate', entity_id=review.id).exists())
+        public = self.client.get(f'/api/catalog/products/{self.product.id}/reviews/')
+        # public endpoint allow any
+        self.client.force_authenticate(user=None)
+        public = self.client.get(f'/api/catalog/products/{self.product.id}/reviews/')
+        self.assertEqual(public.status_code, 200)
+        ids = [r['id'] for r in (public.json() if isinstance(public.json(), list) else public.json().get('results', public.json()))]
+        # response shape may be list or dict
+        payload = public.json()
+        if isinstance(payload, dict):
+            items = payload.get('results') or payload.get('reviews') or []
+        else:
+            items = payload
+        self.assertTrue(any(r.get('id') == review.id for r in items))
+
+    def test_export_orders_csv_staff_only(self):
+        self._make_order()
+        self.client.force_authenticate(user=self.customer)
+        denied = self.client.get('/api/admin/exports/orders/')
+        self.assertIn(denied.status_code, (401, 403))
+        self.client.force_authenticate(user=self.admin)
+        ok = self.client.get('/api/admin/exports/orders/')
+        self.assertEqual(ok.status_code, 200)
+        self.assertIn('text/csv', ok['Content-Type'])
+
+    def test_active_deliveries_and_unassign(self):
+        order = self._make_order(status='READY_FOR_DELIVERY')
+        self.client.force_authenticate(user=self.admin)
+        assign = self.client.post(
+            f'/api/admin/orders/{order.id}/assign-delivery/',
+            {'employee_id': self.employee.id},
+            format='json',
+        )
+        self.assertEqual(assign.status_code, 200)
+        active = self.client.get('/api/admin/deliveries/active/')
+        self.assertEqual(active.status_code, 200)
+        self.assertGreaterEqual(active.json()['count'], 1)
+        unassign = self.client.post(f'/api/admin/orders/{order.id}/unassign-delivery/', {}, format='json')
+        self.assertEqual(unassign.status_code, 200)
+        order.refresh_from_db()
+        self.assertIsNone(order.delivery_employee_id)

@@ -1,4 +1,4 @@
-﻿from django.contrib import admin
+from django.contrib import admin
 
 from .models import DeliverySettings, DeliveryZone, InventoryTransaction, Order, Payment, Product, Refund
 

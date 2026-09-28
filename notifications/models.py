@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.db import models
 
-from .events import ALL_CHANNELS, ALL_EVENTS
+from .events import ALL_CHANNELS
 
 
 class NotificationChannelConfig(models.Model):

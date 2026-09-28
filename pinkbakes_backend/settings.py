@@ -17,6 +17,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://pinkbakes.com')
+PUBLIC_SITE_URL = os.environ.get('PUBLIC_SITE_URL', FRONTEND_URL)
+# Optional public contact phone (storefront WhatsApp). Omit from schema if empty.
+PUBLIC_CONTACT_PHONE = os.environ.get('PUBLIC_CONTACT_PHONE', '6033430700')
 EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
 EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
 EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'true').lower() in ('1', 'true', 'yes', 'on')
@@ -66,6 +69,7 @@ INSTALLED_APPS = [
     'accounts',
     'catalog',
     'notifications',
+    'seo',
 ]
 
 MIDDLEWARE = [

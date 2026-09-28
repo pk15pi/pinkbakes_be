@@ -11,7 +11,6 @@ from django.db import IntegrityError
 from . import events as E
 from .channels import get_adapter
 from .defaults import DEFAULT_CHANNEL_MAP, DEFAULT_EMAIL_TEMPLATES
-from .rendering import flatten_context
 
 logger = logging.getLogger(__name__)
 User = get_user_model()

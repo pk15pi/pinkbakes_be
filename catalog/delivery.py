@@ -1,4 +1,4 @@
-﻿"""
+"""
 Delivery eligibility and charge computation.
 
 Calc order (checkout / payment):

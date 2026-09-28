@@ -22,7 +22,6 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 
 from .models import Coupon, CouponRedemption, Order, Product

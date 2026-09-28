@@ -1,4 +1,4 @@
-﻿"""
+"""
 Inventory / stock service for PinkBakes.
 
 Quantity model (on Product):
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F
 from django.utils import timezone
 
 

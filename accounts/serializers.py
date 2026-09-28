@@ -4,7 +4,7 @@ import secrets
 from datetime import timedelta
 
 from django.contrib.auth import authenticate
-from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.utils import timezone
 from rest_framework import serializers
