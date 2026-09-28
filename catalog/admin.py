@@ -1,6 +1,6 @@
 ﻿from django.contrib import admin
 
-from .models import InventoryTransaction, Order, Payment, Product, Refund
+from .models import DeliverySettings, DeliveryZone, InventoryTransaction, Order, Payment, Product, Refund
 
 
 @admin.register(Refund)
@@ -44,3 +44,30 @@ class InventoryTransactionAdmin(admin.ModelAdmin):
     list_filter = ('adjustment_type', 'reference_type')
     search_fields = ('product__name', 'reference_id', 'reason')
     readonly_fields = ('created_at',)
+
+from .models import Coupon, CouponRedemption
+
+@admin.register(Coupon)
+class CouponAdmin(admin.ModelAdmin):
+    list_display = ('code', 'discount_type', 'discount_value', 'is_active', 'total_used', 'usage_limit')
+    search_fields = ('code', 'name')
+    list_filter = ('is_active', 'discount_type', 'applies_to')
+
+
+@admin.register(CouponRedemption)
+class CouponRedemptionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'coupon', 'user', 'order', 'discount_amount', 'status', 'created_at')
+    list_filter = ('status',)
+
+
+
+@admin.register(DeliveryZone)
+class DeliveryZoneAdmin(admin.ModelAdmin):
+    list_display = ('name', 'is_active', 'delivery_charge', 'minimum_order_amount', 'free_delivery_threshold', 'updated_at')
+    list_filter = ('is_active',)
+    search_fields = ('name', 'city', 'state')
+
+
+@admin.register(DeliverySettings)
+class DeliverySettingsAdmin(admin.ModelAdmin):
+    list_display = ('delivery_enabled', 'default_delivery_charge', 'free_delivery_threshold', 'max_delivery_radius_km', 'updated_at')

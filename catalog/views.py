@@ -16,16 +16,27 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .admin_reporting import AdminReportingService
+from . import coupons as coupon_service
+from . import delivery as delivery_service
 from . import inventory as inventory_service
+from .coupons import CouponError
+from .delivery import DeliveryError
 from .inventory import InsufficientStock, InventoryError
-from .models import AdminActivity, DeliveryLocation, Employee, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
-from .serializers import DeliveryLocationSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
-from accounts.email_service import (
-    send_order_cancellation_email,
-    send_order_confirmation_email,
-    send_refund_completed_email,
-    send_refund_failed_email,
-    send_refund_initiated_email,
+from .admin_ops import (
+    log_admin_activity,
+    paginate_queryset,
+    validate_order_status_transition,
+)
+from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
+from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
+from notifications import events as notification_events
+from notifications.service import (
+    notify as notify_event,
+    notify_order_cancelled,
+    notify_order_confirmed,
+    notify_payment_success,
+    notify_staff_new_order,
+    tracking_url_for_order,
 )
 
 
@@ -251,13 +262,21 @@ class PaymentService:
                     changed_by=changed_by,
                 )
 
-        # Send confirmation email only on first successful transition to paid.
+        # Notify only on first successful transition to paid (idempotent vs verify+webhook).
         if not already_paid and order_was_unpaid:
             try:
-                send_order_confirmation_email(order)
+                notify_order_confirmed(order)
+                notify_payment_success(order, payment)
+                notify_staff_new_order(order)
             except Exception:
-                # Do not fail payment confirmation if email delivery fails.
+                # Do not fail payment confirmation if notification delivery fails.
                 pass
+
+        # Finalize coupon reservation → redeemed (idempotent; only pending rows).
+        try:
+            coupon_service.finalize_redemption_for_order(order)
+        except Exception:
+            pass
 
         # Convert reserved stock → sold exactly once (idempotent via InventoryTransaction).
         try:
@@ -300,7 +319,15 @@ class PaymentService:
 
         if send_email and order:
             try:
-                send_refund_completed_email(order, refund)
+                notify_event(
+                    notification_events.REFUND_COMPLETED,
+                    user=getattr(order, 'user', None),
+                    email=getattr(order, 'customer_email', None),
+                    context={'order': order, 'refund': refund, 'message': f'Refund completed for {order.order_number}.'},
+                    idempotency_key=f'refund_completed:{refund.pk}',
+                    reference_type='refund',
+                    reference_id=str(refund.pk),
+                )
             except Exception:
                 pass
         return refund
@@ -357,7 +384,15 @@ class PaymentService:
             payment.save(update_fields=['status', 'updated_at'])
 
         try:
-            send_refund_initiated_email(order, refund)
+            notify_event(
+                notification_events.REFUND_REQUESTED,
+                user=getattr(order, 'user', None),
+                email=getattr(order, 'customer_email', None),
+                context={'order': order, 'refund': refund, 'message': f'Refund initiated for {order.order_number}.'},
+                idempotency_key=f'refund_requested:{refund.pk}',
+                reference_type='refund',
+                reference_id=str(refund.pk),
+            )
         except Exception:
             pass
 
@@ -402,7 +437,26 @@ class PaymentService:
                 payment.status = 'paid'
                 payment.save(update_fields=['status', 'updated_at'])
             try:
-                send_refund_failed_email(order, refund)
+                notify_event(
+                    notification_events.REFUND_FAILED,
+                    user=getattr(order, 'user', None),
+                    email=getattr(order, 'customer_email', None),
+                    context={'order': order, 'refund': refund, 'message': f'Refund failed for {order.order_number}.'},
+                    idempotency_key=f'refund_failed:{refund.pk}',
+                    reference_type='refund',
+                    reference_id=str(refund.pk),
+                )
+                try:
+                    notify_event(
+                        notification_events.ADMIN_REFUND_FAILED,
+                        context={'order': order, 'refund': refund, 'title': 'Refund failed', 'message': f'Refund failed for {order.order_number}'},
+                        admin=True,
+                        idempotency_key=f'admin_refund_failed:{refund.pk}',
+                        reference_type='refund',
+                        reference_id=str(refund.pk),
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -464,7 +518,15 @@ class PaymentService:
                 payment.status = 'paid'
                 payment.save(update_fields=['status', 'updated_at'])
             try:
-                send_refund_failed_email(refund.order, refund)
+                notify_event(
+                    notification_events.REFUND_FAILED,
+                    user=getattr(refund.order, 'user', None),
+                    email=getattr(refund.order, 'customer_email', None),
+                    context={'order': refund.order, 'refund': refund, 'message': f'Refund failed for {refund.order.order_number}.'},
+                    idempotency_key=f'refund_failed:{refund.pk}',
+                    reference_type='refund',
+                    reference_id=str(refund.pk),
+                )
             except Exception:
                 pass
             return refund
@@ -516,9 +578,17 @@ class PaymentService:
                 prior.save(update_fields=['status', 'updated_at'])
 
         try:
-            send_order_cancellation_email(order, reason=reason)
+            notify_order_cancelled(order, reason=reason)
         except Exception:
             pass
+
+        # Coupons: unpaid cancel voids pending redemption and releases global usage.
+        # Per-user usage is not restored by default (COUPON_RESTORE_ON_CANCEL=false).
+        if not paid_payment:
+            try:
+                coupon_service.void_redemption_for_order(order)
+            except Exception:
+                pass
 
         # Inventory: unpaid → release reservation; paid → restore sold units (idempotent).
         try:
@@ -544,6 +614,39 @@ class PaymentService:
 
 
 
+
+def _checkout_contact_fields(request, shipping):
+    """Merge request contact fields with shipping snapshot (address may supply name/mobile)."""
+    customer_name = (request.data.get("customer_name") or shipping.get("customer_name") or "").strip()
+    customer_email = (request.data.get("customer_email") or getattr(request.user, "email", "") or "").strip()
+    customer_mobile = (request.data.get("customer_mobile") or shipping.get("customer_mobile") or "").strip()
+    missing = []
+    if not customer_name:
+        missing.append("customer_name")
+    if not customer_email:
+        missing.append("customer_email")
+    if not customer_mobile:
+        missing.append("customer_mobile")
+    if missing:
+        raise DeliveryError(f"Missing required checkout fields: {', '.join(missing)}.")
+    return customer_name, customer_email, customer_mobile
+
+
+def _apply_delivery_totals(subtotal, discount_amount, shipping):
+    merchandise_after_coupon = (Decimal(subtotal) - Decimal(discount_amount or 0)).quantize(Decimal("0.01"))
+    if merchandise_after_coupon < 0:
+        merchandise_after_coupon = Decimal("0.00")
+    delivery = delivery_service.require_delivery(
+        merchandise_after_coupon,
+        shipping["postal_code"],
+        latitude=shipping.get("shipping_latitude"),
+        longitude=shipping.get("shipping_longitude"),
+    )
+    totals = coupon_service.apply_totals(subtotal, discount_amount, delivery_fee=delivery["charge"])
+    return totals, delivery
+
+
+
 class PaymentCreateView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -552,10 +655,11 @@ class PaymentCreateView(APIView):
         if not isinstance(items, list) or not items:
             return Response({'detail': 'Your cart is empty.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        required_fields = ['customer_name', 'customer_email', 'customer_mobile', 'shipping_address', 'city', 'state', 'postal_code', 'country']
-        missing = [field for field in required_fields if not str(request.data.get(field, '')).strip()]
-        if missing:
-            return Response({'detail': f'Missing required checkout fields: {", ".join(missing)}.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            shipping = delivery_service.resolve_shipping_from_request(request.user, request.data)
+            customer_name, customer_email, customer_mobile = _checkout_contact_fields(request, shipping)
+        except DeliveryError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             order_items = PaymentService.ensure_valid_cart(items)
@@ -563,27 +667,37 @@ class PaymentCreateView(APIView):
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         subtotal = sum((item['unit_price'] * item['quantity'] for item in order_items), Decimal('0')).quantize(Decimal('0.01'))
+        coupon_code = (request.data.get('coupon_code') or '').strip()
+        discount_amount = Decimal('0.00')
 
-        # When PAYMENT_ENABLED is false we still create a local gateway order so tests/dev work.
-        # Live Razorpay is used only when enabled and real keys are configured.
+        try:
+            totals, delivery = _apply_delivery_totals(subtotal, discount_amount, shipping)
+        except DeliveryError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
             order = Order.objects.create(
                 user=request.user,
-                order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S')}-{request.user.id}",
-                customer_name=request.data['customer_name'].strip(),
-                customer_email=request.data['customer_email'].strip(),
-                customer_mobile=request.data['customer_mobile'].strip(),
-                shipping_address=request.data['shipping_address'].strip(),
-                shipping_address_2=(request.data.get('shipping_address_2') or '').strip(),
-                city=request.data['city'].strip(),
-                state=request.data['state'].strip(),
-                postal_code=request.data['postal_code'].strip(),
-                country=request.data['country'].strip(),
-                subtotal_amount=subtotal,
-                delivery_fee=Decimal('0'),
-                tax_amount=Decimal('0'),
-                total_amount=subtotal,
+                order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S%f')}-{request.user.id}",
+                customer_name=customer_name,
+                customer_email=customer_email,
+                customer_mobile=customer_mobile,
+                shipping_address=shipping['shipping_address'],
+                shipping_address_2=shipping.get('shipping_address_2') or '',
+                landmark=shipping.get('landmark') or '',
+                city=shipping['city'],
+                state=shipping['state'],
+                postal_code=shipping['postal_code'],
+                country=shipping['country'],
+                shipping_latitude=shipping.get('shipping_latitude'),
+                shipping_longitude=shipping.get('shipping_longitude'),
+                address=shipping.get('address'),
+                delivery_zone_id=delivery.get('zone_id'),
+                subtotal_amount=totals['subtotal_amount'],
+                discount_amount=totals['discount_amount'],
+                delivery_fee=totals['delivery_fee'],
+                tax_amount=totals['tax_amount'],
+                total_amount=totals['total_amount'],
                 notes=(request.data.get('notes') or '').strip(),
                 status='PENDING',
                 payment_status='pending',
@@ -601,13 +715,38 @@ class PaymentCreateView(APIView):
                     subtotal=(item['unit_price'] * item['quantity']).quantize(Decimal('0.01')),
                 )
 
+            if coupon_code:
+                try:
+                    discount_amount, _coupon = coupon_service.reserve_coupon_for_order(
+                        request.user, coupon_code, order_items, order,
+                    )
+                except CouponError as exc:
+                    transaction.set_rollback(True)
+                    return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                try:
+                    totals, delivery = _apply_delivery_totals(subtotal, discount_amount, shipping)
+                except DeliveryError as exc:
+                    transaction.set_rollback(True)
+                    return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                order.subtotal_amount = totals['subtotal_amount']
+                order.discount_amount = totals['discount_amount']
+                order.delivery_fee = totals['delivery_fee']
+                order.tax_amount = totals['tax_amount']
+                order.total_amount = totals['total_amount']
+                order.delivery_zone_id = delivery.get('zone_id')
+                order.save(update_fields=[
+                    'subtotal_amount', 'discount_amount', 'delivery_fee', 'tax_amount',
+                    'total_amount', 'delivery_zone', 'updated_at',
+                ])
+
             try:
                 inventory_service.reserve_order(order, user=request.user)
             except InsufficientStock as exc:
                 transaction.set_rollback(True)
                 return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-            amount_paise = PaymentService.amount_paise(subtotal)
+            payable = order.total_amount
+            amount_paise = PaymentService.amount_paise(payable)
             try:
                 gateway_order_id = PaymentService.create_razorpay_order(
                     amount_paise=amount_paise,
@@ -623,7 +762,7 @@ class PaymentCreateView(APIView):
                 user=request.user,
                 gateway='razorpay',
                 gateway_order_id=gateway_order_id,
-                amount=subtotal,
+                amount=payable,
                 currency=settings.RAZORPAY_CURRENCY,
                 status='created',
             )
@@ -636,6 +775,8 @@ class PaymentCreateView(APIView):
             'key_id': settings.RAZORPAY_KEY_ID,
             'order_id': order.id,
             'payment_id': payment.id,
+            'delivery_fee': float(order.delivery_fee),
+            'total_amount': float(order.total_amount),
         }, status=status.HTTP_200_OK)
 
 
@@ -1006,6 +1147,35 @@ class ProductReviewListView(APIView):
         )
 
         update_product_rating(product)
+        try:
+            notify_event(
+                notification_events.REVIEW_SUBMITTED,
+                user=request.user,
+                context={
+                    'review': review,
+                    'product': product,
+                    'title': 'Review submitted',
+                    'message': f'Your review for {product.name} is pending approval.',
+                },
+                channels=['in_app'],
+                reference_type='review',
+                reference_id=str(review.pk),
+            )
+            notify_event(
+                notification_events.REVIEW_SUBMITTED,
+                context={
+                    'review': review,
+                    'product': product,
+                    'title': 'New review pending',
+                    'message': f'New review for {product.name} awaits approval.',
+                },
+                admin=True,
+                channels=['in_app'],
+                reference_type='review',
+                reference_id=str(review.pk),
+            )
+        except Exception:
+            pass
         return Response({
             'message': 'Review submitted successfully and is pending admin approval.',
             'review': ReviewSerializer(review).data,
@@ -1102,6 +1272,28 @@ class AdminReviewApproveView(APIView):
         review.rejected_at = None
         review.save(update_fields=['status', 'admin_comment', 'approved_by', 'approved_at', 'rejected_at', 'updated_at'])
         update_product_rating(review.product)
+        try:
+            notify_event(
+                notification_events.REVIEW_APPROVED,
+                user=review.user,
+                email=getattr(review.user, 'email', None),
+                context={
+                    'review': review,
+                    'product': review.product,
+                    'user_name': review.user.first_name or review.user.username,
+                    'product_name': review.product.name if review.product else '',
+                    'message': 'Your review was approved.',
+                },
+                idempotency_key=f'review_approved:{review.pk}',
+                reference_type='review',
+                reference_id=str(review.pk),
+            )
+        except Exception:
+            pass
+        log_admin_activity(
+            request.user, 'review_moderate', entity_type='review', entity_id=review.id,
+            description=f'Approved review {review.id}', request=request,
+        )
         return Response({'message': 'Review approved successfully.', 'review': ReviewSerializer(review).data}, status=status.HTTP_200_OK)
 
 
@@ -1122,6 +1314,28 @@ class AdminReviewRejectView(APIView):
         review.approved_at = None
         review.save(update_fields=['status', 'admin_comment', 'rejected_at', 'approved_by', 'approved_at', 'updated_at'])
         update_product_rating(review.product)
+        try:
+            notify_event(
+                notification_events.REVIEW_REJECTED,
+                user=review.user,
+                email=getattr(review.user, 'email', None),
+                context={
+                    'review': review,
+                    'product': review.product,
+                    'user_name': review.user.first_name or review.user.username,
+                    'product_name': review.product.name if review.product else '',
+                    'message': 'Your review was not approved.',
+                },
+                idempotency_key=f'review_rejected:{review.pk}',
+                reference_type='review',
+                reference_id=str(review.pk),
+            )
+        except Exception:
+            pass
+        log_admin_activity(
+            request.user, 'review_moderate', entity_type='review', entity_id=review.id,
+            description=f'Rejected review {review.id}', request=request,
+        )
         return Response({'message': 'Review rejected successfully.', 'review': ReviewSerializer(review).data}, status=status.HTTP_200_OK)
 
 
@@ -1168,10 +1382,11 @@ class OrderCheckoutView(APIView):
         if not isinstance(items, list) or not items:
             return Response({'detail': 'Your cart is empty.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        required_fields = ['customer_name', 'customer_email', 'customer_mobile', 'shipping_address', 'city', 'state', 'postal_code', 'country']
-        missing = [field for field in required_fields if not str(request.data.get(field, '')).strip()]
-        if missing:
-            return Response({'detail': f'Missing required checkout fields: {", ".join(missing)}.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            shipping = delivery_service.resolve_shipping_from_request(request.user, request.data)
+            customer_name, customer_email, customer_mobile = _checkout_contact_fields(request, shipping)
+        except DeliveryError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             validated = PaymentService.ensure_valid_cart(items)
@@ -1179,24 +1394,37 @@ class OrderCheckoutView(APIView):
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         subtotal = sum((row['unit_price'] * row['quantity'] for row in validated), Decimal('0')).quantize(Decimal('0.01'))
+        coupon_code = (request.data.get('coupon_code') or '').strip()
+        discount_amount = Decimal('0.00')
+
+        try:
+            totals, delivery = _apply_delivery_totals(subtotal, discount_amount, shipping)
+        except DeliveryError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
             order = Order.objects.create(
                 user=request.user,
-                order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S')}-{request.user.id}",
-                customer_name=request.data['customer_name'].strip(),
-                customer_email=request.data['customer_email'].strip(),
-                customer_mobile=request.data['customer_mobile'].strip(),
-                shipping_address=request.data['shipping_address'].strip(),
-                shipping_address_2=(request.data.get('shipping_address_2') or '').strip(),
-                city=request.data['city'].strip(),
-                state=request.data['state'].strip(),
-                postal_code=request.data['postal_code'].strip(),
-                country=request.data['country'].strip(),
-                subtotal_amount=subtotal,
-                delivery_fee=Decimal('0'),
-                tax_amount=Decimal('0'),
-                total_amount=subtotal,
+                order_number=f"PB-{timezone.now().strftime('%Y%m%d')}-{timezone.now().strftime('%H%M%S%f')}-{request.user.id}",
+                customer_name=customer_name,
+                customer_email=customer_email,
+                customer_mobile=customer_mobile,
+                shipping_address=shipping['shipping_address'],
+                shipping_address_2=shipping.get('shipping_address_2') or '',
+                landmark=shipping.get('landmark') or '',
+                city=shipping['city'],
+                state=shipping['state'],
+                postal_code=shipping['postal_code'],
+                country=shipping['country'],
+                shipping_latitude=shipping.get('shipping_latitude'),
+                shipping_longitude=shipping.get('shipping_longitude'),
+                address=shipping.get('address'),
+                delivery_zone_id=delivery.get('zone_id'),
+                subtotal_amount=totals['subtotal_amount'],
+                discount_amount=totals['discount_amount'],
+                delivery_fee=totals['delivery_fee'],
+                tax_amount=totals['tax_amount'],
+                total_amount=totals['total_amount'],
                 notes=(request.data.get('notes') or '').strip(),
                 status='PENDING',
                 payment_status='pending',
@@ -1214,13 +1442,37 @@ class OrderCheckoutView(APIView):
                     subtotal=(row['unit_price'] * row['quantity']).quantize(Decimal('0.01')),
                 )
 
+            if coupon_code:
+                try:
+                    discount_amount, _coupon = coupon_service.reserve_coupon_for_order(
+                        request.user, coupon_code, validated, order,
+                    )
+                except CouponError as exc:
+                    transaction.set_rollback(True)
+                    return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                try:
+                    totals, delivery = _apply_delivery_totals(subtotal, discount_amount, shipping)
+                except DeliveryError as exc:
+                    transaction.set_rollback(True)
+                    return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                order.subtotal_amount = totals['subtotal_amount']
+                order.discount_amount = totals['discount_amount']
+                order.delivery_fee = totals['delivery_fee']
+                order.tax_amount = totals['tax_amount']
+                order.total_amount = totals['total_amount']
+                order.delivery_zone_id = delivery.get('zone_id')
+                order.save(update_fields=[
+                    'subtotal_amount', 'discount_amount', 'delivery_fee', 'tax_amount',
+                    'total_amount', 'delivery_zone', 'updated_at',
+                ])
+
             try:
                 inventory_service.reserve_order(order, user=request.user)
             except InsufficientStock as exc:
                 transaction.set_rollback(True)
                 return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+        return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_201_CREATED)
 
 
 class OrderListView(APIView):
@@ -1274,9 +1526,10 @@ class AdminOrderListView(APIView):
         if date_to:
             orders = orders.filter(created_at__date__lte=date_to)
 
+        rows, meta = paginate_queryset(orders, request)
         return Response({
-            'count': orders.count(),
-            'results': OrderSerializer(orders, many=True, context={'request': request}).data,
+            **meta,
+            'results': OrderSerializer(rows, many=True, context={'request': request}).data,
         }, status=status.HTTP_200_OK)
 
 
@@ -1300,8 +1553,16 @@ class AdminPaymentListView(APIView):
                 | Q(user__email__icontains=search)
             )
 
+        date_from = (request.query_params.get('date_from') or '').strip()
+        date_to = (request.query_params.get('date_to') or '').strip()
+        if date_from:
+            payments = payments.filter(created_at__date__gte=date_from)
+        if date_to:
+            payments = payments.filter(created_at__date__lte=date_to)
+
+        page_rows, meta = paginate_queryset(payments, request)
         results = []
-        for payment in payments[:500]:
+        for payment in page_rows:
             order = payment.order
             results.append({
                 'id': payment.id,
@@ -1322,7 +1583,7 @@ class AdminPaymentListView(APIView):
             })
 
         return Response({
-            'count': len(results),
+            **meta,
             'results': results,
         }, status=status.HTTP_200_OK)
 
@@ -1418,6 +1679,31 @@ class AdminAssignDeliveryView(APIView):
             message='Delivery boy assigned by admin.',
             changed_by=request.user,
         )
+        log_admin_activity(
+            request.user, 'employee_assign', entity_type='order', entity_id=order.id,
+            description=f'Assigned employee {employee.employee_id} to {order.order_number}',
+            request=request,
+        )
+
+        try:
+            notify_event(
+                notification_events.DELIVERY_ASSIGNED,
+                user=getattr(order, 'user', None),
+                email=getattr(order, 'customer_email', None),
+                context={
+                    'order': order,
+                    'user_name': order.customer_name,
+                    'order_number': order.order_number,
+                    'tracking_url': tracking_url_for_order(order),
+                    'tracking_message': 'You can track your order from your account.',
+                    'message': f'Delivery partner assigned for {order.order_number}.',
+                },
+                idempotency_key=f'delivery_assigned:{order.pk}:{employee.pk}',
+                reference_type='order',
+                reference_id=str(order.pk),
+            )
+        except Exception:
+            pass
 
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
@@ -1436,6 +1722,11 @@ class AdminOrderStatusUpdateView(APIView):
         if new_status not in dict(Order.STATUS_CHOICES):
             return Response({'detail': 'Invalid order status.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        ok, err = validate_order_status_transition(order.status, new_status)
+        if not ok:
+            return Response({'detail': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        previous_status = order.status
         order.status = new_status
         if new_status == 'OUT_FOR_DELIVERY':
             order.delivery_started_at = timezone.now()
@@ -1452,6 +1743,61 @@ class AdminOrderStatusUpdateView(APIView):
             message=request.data.get('message', f'Order status updated to {new_status}.'),
             changed_by=request.user,
         )
+        log_admin_activity(
+            request.user, 'order_status', entity_type='order', entity_id=order.id,
+            description=f'Status {previous_status} -> {new_status} for {order.order_number}',
+            request=request,
+        )
+
+        try:
+            ctx = {
+                'order': order,
+                'user_name': order.customer_name,
+                'order_number': order.order_number,
+                'tracking_url': tracking_url_for_order(order),
+                'message': f'Order {order.order_number} status: {new_status}.',
+            }
+            if new_status == 'OUT_FOR_DELIVERY':
+                notify_event(
+                    notification_events.ORDER_OUT_FOR_DELIVERY,
+                    user=getattr(order, 'user', None),
+                    email=getattr(order, 'customer_email', None),
+                    context=ctx,
+                    idempotency_key=f'out_for_delivery:{order.pk}',
+                    reference_type='order',
+                    reference_id=str(order.pk),
+                )
+            elif new_status == 'DELIVERED':
+                notify_event(
+                    notification_events.DELIVERY_COMPLETED,
+                    user=getattr(order, 'user', None),
+                    email=getattr(order, 'customer_email', None),
+                    context=ctx,
+                    idempotency_key=f'delivery_completed:{order.pk}',
+                    reference_type='order',
+                    reference_id=str(order.pk),
+                )
+            elif new_status == 'READY_FOR_DELIVERY':
+                notify_event(
+                    notification_events.ORDER_READY_FOR_DELIVERY,
+                    user=getattr(order, 'user', None),
+                    email=getattr(order, 'customer_email', None),
+                    context=ctx,
+                    idempotency_key=f'ready_for_delivery:{order.pk}',
+                    reference_type='order',
+                    reference_id=str(order.pk),
+                )
+            else:
+                notify_event(
+                    notification_events.ORDER_STATUS_CHANGED,
+                    user=getattr(order, 'user', None),
+                    context=ctx,
+                    channels=['in_app'],
+                    reference_type='order',
+                    reference_id=str(order.pk),
+                )
+        except Exception:
+            pass
 
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
@@ -1470,6 +1816,20 @@ class OrderTrackingView(APIView):
         payload = {
             'order_number': order.order_number,
             'status': order.status,
+            'shipping_snapshot': {
+                'customer_name': order.customer_name,
+                'customer_mobile': order.customer_mobile,
+                'shipping_address': order.shipping_address,
+                'shipping_address_2': order.shipping_address_2,
+                'landmark': getattr(order, 'landmark', '') or '',
+                'city': order.city,
+                'state': order.state,
+                'postal_code': order.postal_code,
+                'country': order.country,
+                'latitude': float(order.shipping_latitude) if order.shipping_latitude is not None else None,
+                'longitude': float(order.shipping_longitude) if order.shipping_longitude is not None else None,
+                'delivery_fee': float(order.delivery_fee or 0),
+            },
             'status_history': [
                 {'status': item.status, 'timestamp': item.created_at.isoformat(), 'message': item.message}
                 for item in order.status_history.all()
@@ -1710,9 +2070,10 @@ class AdminRefundListView(APIView):
         order_id = (request.query_params.get('order_id') or '').strip()
         if order_id:
             refunds = refunds.filter(order_id=order_id)
+        rows, meta = paginate_queryset(refunds, request)
         return Response({
-            'count': refunds.count(),
-            'results': RefundSerializer(refunds[:200], many=True).data,
+            **meta,
+            'results': RefundSerializer(rows, many=True).data,
         }, status=status.HTTP_200_OK)
 
 
@@ -1847,4 +2208,219 @@ class AdminInventoryLowStockView(APIView):
         ).order_by('available_quantity', 'name')
         data = ProductSerializer(qs, many=True, context={'request': request}).data
         return Response({'count': qs.count(), 'results': data}, status=status.HTTP_200_OK)
+
+
+
+class CouponValidateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        code = request.data.get('code') or ''
+        items = request.data.get('items') or []
+        if not isinstance(items, list):
+            return Response({'detail': 'items must be a list.'}, status=status.HTTP_400_BAD_REQUEST)
+        payload = coupon_service.public_validate_payload(request.user, code, items)
+        http_status = status.HTTP_200_OK if payload.get('valid') else status.HTTP_400_BAD_REQUEST
+        return Response(payload, status=http_status)
+
+
+class AdminCouponListCreateView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        qs = Coupon.objects.all().prefetch_related('products').order_by('-created_at')
+        active = (request.query_params.get('is_active') or '').strip().lower()
+        if active in ('1', 'true', 'yes'):
+            qs = qs.filter(is_active=True)
+        elif active in ('0', 'false', 'no'):
+            qs = qs.filter(is_active=False)
+        search = (request.query_params.get('search') or '').strip()
+        if search:
+            qs = qs.filter(Q(code__icontains=search) | Q(name__icontains=search))
+        return Response({
+            'count': qs.count(),
+            'results': CouponSerializer(qs, many=True, context={'request': request}).data,
+        }, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = CouponSerializer(data=request.data, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        coupon = serializer.save()
+        return Response(CouponSerializer(coupon, context={'request': request}).data, status=status.HTTP_201_CREATED)
+
+
+class AdminCouponDetailView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get_object(self, coupon_id):
+        return Coupon.objects.filter(id=coupon_id).prefetch_related('products').first()
+
+    def get(self, request, coupon_id):
+        coupon = self.get_object(coupon_id)
+        if not coupon:
+            return Response({'detail': 'Coupon not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(CouponSerializer(coupon, context={'request': request}).data, status=status.HTTP_200_OK)
+
+    def patch(self, request, coupon_id):
+        coupon = self.get_object(coupon_id)
+        if not coupon:
+            return Response({'detail': 'Coupon not found.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = CouponSerializer(coupon, data=request.data, partial=True, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        coupon = serializer.save()
+        return Response(CouponSerializer(coupon, context={'request': request}).data, status=status.HTTP_200_OK)
+
+
+class AdminCouponRedemptionsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, coupon_id):
+        coupon = Coupon.objects.filter(id=coupon_id).first()
+        if not coupon:
+            return Response({'detail': 'Coupon not found.'}, status=status.HTTP_404_NOT_FOUND)
+        qs = CouponRedemption.objects.filter(coupon=coupon).select_related('user', 'order', 'coupon').order_by('-created_at')
+        return Response({
+            'count': qs.count(),
+            'results': CouponRedemptionSerializer(qs, many=True).data,
+        }, status=status.HTTP_200_OK)
+
+
+class DeliveryQuoteView(APIView):
+    """Preview delivery charge/eligibility before payment. Auth required."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        items = request.data.get('items') or []
+        coupon_code = (request.data.get('coupon_code') or '').strip()
+
+        try:
+            shipping = delivery_service.resolve_shipping_from_request(request.user, request.data)
+        except DeliveryError as exc:
+            # Allow quoting with only postal_code when no full address yet
+            postal = (request.data.get('postal_code') or '').strip()
+            if not postal:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            shipping = {
+                'postal_code': delivery_service.normalize_postal_code(postal),
+                'shipping_latitude': request.data.get('shipping_latitude') or request.data.get('latitude'),
+                'shipping_longitude': request.data.get('shipping_longitude') or request.data.get('longitude'),
+            }
+
+        subtotal = Decimal('0.00')
+        discount_amount = Decimal('0.00')
+        if isinstance(items, list) and items:
+            try:
+                rows = PaymentService.ensure_valid_cart(items)
+            except ValueError as exc:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            subtotal = sum((r['unit_price'] * r['quantity'] for r in rows), Decimal('0')).quantize(Decimal('0.01'))
+            if coupon_code:
+                try:
+                    result = coupon_service.validate_coupon(request.user, coupon_code, rows, lock=False)
+                    discount_amount = result['discount_amount']
+                except CouponError as exc:
+                    return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        merchandise = (subtotal - discount_amount).quantize(Decimal('0.01'))
+        if merchandise < 0:
+            merchandise = Decimal('0.00')
+
+        lat = shipping.get('shipping_latitude')
+        lng = shipping.get('shipping_longitude')
+        quote = delivery_service.compute_delivery(
+            merchandise,
+            shipping.get('postal_code'),
+            latitude=lat,
+            longitude=lng,
+        )
+        totals = coupon_service.apply_totals(subtotal, discount_amount, delivery_fee=quote['charge'] if quote['eligible'] else Decimal('0.00'))
+
+        return Response({
+            'eligible': quote['eligible'],
+            'delivery_fee': float(quote['charge']),
+            'message': quote['message'],
+            'min_order_ok': quote['min_order_ok'],
+            'eta_min_minutes': quote['eta_min_minutes'],
+            'eta_max_minutes': quote['eta_max_minutes'],
+            'zone_id': quote['zone_id'],
+            'zone_name': quote['zone'].name if quote['zone'] else None,
+            'distance_km': quote['distance_km'],
+            'free_delivery_applied': quote['free_delivery_applied'],
+            'subtotal_amount': float(totals['subtotal_amount']),
+            'discount_amount': float(totals['discount_amount']),
+            'total_amount': float(totals['total_amount']) if quote['eligible'] else None,
+            'postal_code': delivery_service.normalize_postal_code(shipping.get('postal_code')),
+        }, status=status.HTTP_200_OK)
+
+
+class AdminDeliveryZoneListCreateView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        qs = DeliveryZone.objects.all().order_by('name')
+        active = (request.query_params.get('is_active') or '').strip().lower()
+        if active in ('1', 'true', 'yes'):
+            qs = qs.filter(is_active=True)
+        elif active in ('0', 'false', 'no'):
+            qs = qs.filter(is_active=False)
+        return Response({
+            'count': qs.count(),
+            'results': DeliveryZoneSerializer(qs, many=True).data,
+        }, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = DeliveryZoneSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        zone = serializer.save()
+        return Response(DeliveryZoneSerializer(zone).data, status=status.HTTP_201_CREATED)
+
+
+class AdminDeliveryZoneDetailView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get_object(self, zone_id):
+        return DeliveryZone.objects.filter(id=zone_id).first()
+
+    def get(self, request, zone_id):
+        zone = self.get_object(zone_id)
+        if not zone:
+            return Response({'detail': 'Delivery zone not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(DeliveryZoneSerializer(zone).data, status=status.HTTP_200_OK)
+
+    def patch(self, request, zone_id):
+        zone = self.get_object(zone_id)
+        if not zone:
+            return Response({'detail': 'Delivery zone not found.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = DeliveryZoneSerializer(zone, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        zone = serializer.save()
+        return Response(DeliveryZoneSerializer(zone).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, zone_id):
+        zone = self.get_object(zone_id)
+        if not zone:
+            return Response({'detail': 'Delivery zone not found.'}, status=status.HTTP_404_NOT_FOUND)
+        zone.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AdminDeliverySettingsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        settings_row = DeliverySettings.get_solo()
+        return Response(DeliverySettingsSerializer(settings_row).data, status=status.HTTP_200_OK)
+
+    def patch(self, request):
+        settings_row = DeliverySettings.get_solo()
+        serializer = DeliverySettingsSerializer(settings_row, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        settings_row = serializer.save()
+        return Response(DeliverySettingsSerializer(settings_row).data, status=status.HTTP_200_OK)
 

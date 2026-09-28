@@ -1,5 +1,6 @@
 from django.urls import path
 
+from .address_views import AddressDetailView, AddressListCreateView, AddressSetDefaultView
 from .views import (
     ForgotPasswordView,
     MeView,
@@ -26,4 +27,11 @@ urlpatterns = [
     path('verify-reset-token/', VerifyResetTokenView.as_view(), name='verify-reset-token'),
     path('reset-password/', ResetPasswordView.as_view(), name='reset-password'),
     path('me/', MeView.as_view(), name='me'),
+]
+
+# Mounted at /api/ via project urls (alongside catalog).
+address_urlpatterns = [
+    path('addresses/', AddressListCreateView.as_view(), name='address-list-create'),
+    path('addresses/<int:address_id>/', AddressDetailView.as_view(), name='address-detail'),
+    path('addresses/<int:address_id>/set-default/', AddressSetDefaultView.as_view(), name='address-set-default'),
 ]

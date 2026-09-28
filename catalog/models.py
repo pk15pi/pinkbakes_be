@@ -187,10 +187,29 @@ class Order(models.Model):
     state = models.CharField(max_length=80)
     postal_code = models.CharField(max_length=20)
     country = models.CharField(max_length=80)
+    landmark = models.CharField(max_length=120, blank=True, default='')
+    shipping_latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    shipping_longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    address = models.ForeignKey(
+        'accounts.CustomerAddress', related_name='orders', on_delete=models.SET_NULL,
+        null=True, blank=True,
+    )
+    delivery_zone = models.ForeignKey(
+        'DeliveryZone', related_name='orders', on_delete=models.SET_NULL,
+        null=True, blank=True,
+    )
     subtotal_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     delivery_fee = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    coupon = models.ForeignKey(
+        'Coupon', related_name='orders', on_delete=models.SET_NULL, null=True, blank=True,
+    )
+    coupon_code = models.CharField(max_length=40, blank=True, default='')
+    coupon_discount_type = models.CharField(max_length=20, blank=True, default='')
+    coupon_discount_value = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    coupon_discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='ORDER_CONFIRMED')
     payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
     delivery_employee = models.ForeignKey('Employee', related_name='orders_assigned', on_delete=models.SET_NULL, null=True, blank=True)
@@ -395,6 +414,17 @@ class AdminActivity(models.Model):
         ('product_3d_upload', '3D Asset Upload'),
         ('review_moderate', 'Review Moderated'),
         ('settings_update', 'Settings Updated'),
+        ('order_status', 'Order Status Updated'),
+        ('order_cancel', 'Order Cancelled'),
+        ('refund', 'Refund Action'),
+        ('inventory_adjust', 'Inventory Adjusted'),
+        ('coupon_create', 'Coupon Created'),
+        ('coupon_update', 'Coupon Updated'),
+        ('employee_assign', 'Delivery Employee Assigned'),
+        ('employee_unassign', 'Delivery Employee Unassigned'),
+        ('employee_update', 'Employee Updated'),
+        ('customer_status', 'Customer Account Status'),
+        ('export', 'Data Export'),
     ]
 
     admin_user = models.ForeignKey(User, related_name='admin_activities', on_delete=models.CASCADE)
@@ -452,4 +482,148 @@ class InventoryTransaction(models.Model):
 
     def __str__(self):
         return f'{self.product_id} {self.adjustment_type} {self.quantity_change}'
+
+
+
+class Coupon(models.Model):
+    DISCOUNT_TYPE_CHOICES = [
+        ('percentage', 'Percentage'),
+        ('fixed_amount', 'Fixed Amount'),
+    ]
+    APPLIES_TO_CHOICES = [
+        ('all', 'All products'),
+        ('products', 'Specific products'),
+        ('categories', 'Specific categories'),
+    ]
+
+    code = models.CharField(max_length=40, unique=True)
+    name = models.CharField(max_length=120, blank=True, default='')
+    description = models.TextField(blank=True, default='')
+    discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPE_CHOICES, default='percentage')
+    discount_value = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    minimum_order_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    maximum_discount_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    start_at = models.DateTimeField(null=True, blank=True)
+    end_at = models.DateTimeField(null=True, blank=True)
+    usage_limit = models.PositiveIntegerField(null=True, blank=True)
+    usage_limit_per_user = models.PositiveIntegerField(null=True, blank=True)
+    total_used = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    applies_to = models.CharField(max_length=20, choices=APPLIES_TO_CHOICES, default='all')
+    products = models.ManyToManyField('Product', related_name='coupons', blank=True)
+    # Product.category is a CharField (not an FK model); store matching category names as JSON list.
+    category_names = models.JSONField(default=list, blank=True)
+    exclude_already_discounted = models.BooleanField(default=False)
+    new_customers_only = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        User, related_name='created_coupons', on_delete=models.SET_NULL, null=True, blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['code']),
+            models.Index(fields=['is_active', 'start_at', 'end_at']),
+        ]
+
+    def __str__(self):
+        return self.code
+
+    def save(self, *args, **kwargs):
+        self.code = (self.code or '').strip().upper()
+        super().save(*args, **kwargs)
+
+
+class CouponRedemption(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('redeemed', 'Redeemed'),
+        ('voided', 'Voided'),
+    ]
+
+    coupon = models.ForeignKey('Coupon', related_name='redemptions', on_delete=models.CASCADE)
+    user = models.ForeignKey(User, related_name='coupon_redemptions', on_delete=models.CASCADE)
+    order = models.ForeignKey(
+        'Order', related_name='coupon_redemptions', on_delete=models.SET_NULL, null=True, blank=True,
+    )
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    redeemed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['coupon', 'user', 'status']),
+            models.Index(fields=['order', 'status']),
+            models.Index(fields=['status', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.coupon_id} / {self.user_id} / {self.status}'
+
+
+class DeliveryZone(models.Model):
+    """PIN-based delivery zone. postal_codes is a JSON list of 6-digit PIN strings."""
+
+    name = models.CharField(max_length=120)
+    postal_codes = models.JSONField(default=list, blank=True)
+    city = models.CharField(max_length=80, blank=True, default='')
+    state = models.CharField(max_length=80, blank=True, default='')
+    is_active = models.BooleanField(default=True)
+    delivery_charge = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    minimum_order_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    free_delivery_threshold = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    eta_min_minutes = models.PositiveIntegerField(null=True, blank=True)
+    eta_max_minutes = models.PositiveIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        indexes = [
+            models.Index(fields=['is_active', 'name']),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    def normalized_postal_codes(self):
+        codes = []
+        for raw in (self.postal_codes or []):
+            code = ''.join(ch for ch in str(raw) if ch.isdigit())
+            if code:
+                codes.append(code)
+        return codes
+
+
+class DeliverySettings(models.Model):
+    """Singleton row for bakery location, radius, and global delivery defaults."""
+
+    delivery_enabled = models.BooleanField(default=True)
+    default_delivery_charge = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    free_delivery_threshold = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    bakery_latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    bakery_longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    max_delivery_radius_km = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    per_km_charge = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Delivery settings'
+        verbose_name_plural = 'Delivery settings'
+
+    def __str__(self):
+        return 'Delivery settings'
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
 

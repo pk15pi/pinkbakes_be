@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
 
-from .models import AdminActivity, Order, Payment, Product, ProductView, Refund, Review
+from .models import AdminActivity, CouponRedemption, Order, Payment, Product, ProductView, Refund, Review
 
 
 class AdminReportingService:
@@ -143,6 +143,9 @@ class AdminReportingService:
             'orders_this_week': order_queryset.filter(created_at__gte=timezone.now() - timedelta(days=7)).count(),
             'orders_this_month': order_queryset.filter(created_at__gte=timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)).count(),
             'total_sales': total_sales,
+            'gross_sales': total_sales,
+            'discounts': float((order_queryset.filter(payment_status__in=['paid', 'refunded']).aggregate(total=Sum('discount_amount'))['total'] or 0)),
+            'delivery_charges': float((order_queryset.filter(payment_status__in=['paid', 'refunded']).aggregate(total=Sum('delivery_fee'))['total'] or 0)),
             'today_sales': float((paid_like.filter(created_at__date=timezone.now().date()).aggregate(total=Sum('amount'))['total'] or 0)),
             'monthly_sales': float((paid_like.filter(created_at__gte=timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)).aggregate(total=Sum('amount'))['total'] or 0)),
             'average_order_value': float((order_queryset.aggregate(avg=Avg('total_amount'))['avg'] or 0)),
@@ -158,6 +161,16 @@ class AdminReportingService:
             'transactions': payments.count(),
             'currency': 'INR',
             'note': 'Payment and order data are now integrated into revenue reporting. net_sales = successful payments - completed refunds.',
+            'coupons_used_count': CouponRedemption.objects.filter(
+                status='redeemed', created_at__gte=start, created_at__lte=end,
+            ).count(),
+            'coupon_discounts': float((order_queryset.filter(coupon_discount_amount__gt=0).aggregate(total=Sum('coupon_discount_amount'))['total'] or 0)),
+            'total_coupon_discount': float((
+                order_queryset.filter(coupon_discount_amount__gt=0).aggregate(
+                    total=Sum('coupon_discount_amount')
+                )['total'] or 0
+            )),
+            'orders_with_coupon': order_queryset.exclude(coupon_code='').count(),
         }
         return sales
 

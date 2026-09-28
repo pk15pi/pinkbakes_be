@@ -8,7 +8,7 @@ from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from .models import InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review
+from .models import Coupon, CouponRedemption, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review
 from . import inventory as inventory_service
 
 
@@ -1141,4 +1141,683 @@ class InventoryConcurrencyTests(TransactionTestCase):
         self.product.refresh_from_db()
         self.assertEqual(self.product.available_quantity, 0)
         self.assertEqual(self.product.reserved_quantity, 1)
+
+
+
+
+class CouponAPITests(TestCase):
+    def setUp(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        from .models import Coupon
+
+        self.timezone = timezone
+        self.timedelta = timedelta
+        self.Coupon = Coupon
+        self.client = APIClient()
+        self.admin = User.objects.create_user(username='coupon_admin', password='securepass123', is_staff=True)
+        self.user = User.objects.create_user(username='coupon_user', email='coupon@example.com', password='securepass123')
+        self.product = Product.objects.create(
+            name='Coupon Cake',
+            category='Birthday Cakes',
+            price=Decimal('1000.00'),
+            discount=0,
+            availability='in_stock',
+            status='published',
+            is_active=True,
+            available_quantity=100,
+        )
+        self.discounted_product = Product.objects.create(
+            name='Already Discounted Cake',
+            category='Chocolate Cakes',
+            price=Decimal('1000.00'),
+            discount=20,
+            availability='in_stock',
+            status='published',
+            is_active=True,
+            available_quantity=100,
+        )
+
+    def _make_coupon(self, **kwargs):
+        defaults = dict(
+            code='SAVE10',
+            name='Save 10',
+            discount_type='percentage',
+            discount_value=Decimal('10'),
+            minimum_order_amount=Decimal('0'),
+            is_active=True,
+            applies_to='all',
+        )
+        defaults.update(kwargs)
+        return self.Coupon.objects.create(**defaults)
+
+    def _checkout_fields(self):
+        return {
+            'customer_name': 'Coupon User',
+            'customer_email': 'coupon@example.com',
+            'customer_mobile': '9876543210',
+            'shipping_address': '12 Market Road',
+            'city': 'Mumbai',
+            'state': 'Maharashtra',
+            'postal_code': '400001',
+            'country': 'India',
+        }
+
+    def test_validate_valid_percentage(self):
+        self._make_coupon()
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'save10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(data['valid'])
+        self.assertEqual(data['code'], 'SAVE10')
+        self.assertEqual(float(data['discount_amount']), 100.0)
+
+    def test_validate_invalid_code(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'NOPE',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(response.json()['valid'])
+
+    def test_validate_inactive(self):
+        self._make_coupon(is_active=False)
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_validate_expired(self):
+        past = self.timezone.now() - self.timedelta(days=2)
+        self._make_coupon(start_at=past - self.timedelta(days=5), end_at=past)
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_validate_future(self):
+        future = self.timezone.now() + self.timedelta(days=2)
+        self._make_coupon(start_at=future, end_at=future + self.timedelta(days=5))
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_validate_min_order(self):
+        self._make_coupon(minimum_order_amount=Decimal('2000'))
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_validate_max_discount_cap(self):
+        self._make_coupon(discount_type='percentage', discount_value=Decimal('50'), maximum_discount_amount=Decimal('100'))
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(float(response.json()['discount_amount']), 100.0)
+
+    def test_validate_fixed_amount(self):
+        self._make_coupon(discount_type='fixed_amount', discount_value=Decimal('150'))
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(float(response.json()['discount_amount']), 150.0)
+
+    def test_validate_product_specific(self):
+        coupon = self._make_coupon(applies_to='products')
+        coupon.products.add(self.product)
+        self.client.force_authenticate(user=self.user)
+        ok = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(ok.status_code, status.HTTP_200_OK)
+        bad = self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.discounted_product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(bad.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_validate_does_not_increment_usage(self):
+        coupon = self._make_coupon(usage_limit=5)
+        self.client.force_authenticate(user=self.user)
+        self.client.post('/api/coupons/validate/', {
+            'code': 'SAVE10',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        coupon.refresh_from_db()
+        self.assertEqual(coupon.total_used, 0)
+
+    def test_payment_create_applies_coupon_to_amount(self):
+        self._make_coupon(discount_type='fixed_amount', discount_value=Decimal('100'))
+        self.client.force_authenticate(user=self.user)
+        payload = {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }
+        response = self.client.post('/api/payments/create/', payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data['amount'], 90000)  # 900 INR in paise
+        order = Order.objects.get(id=data['order_id'])
+        self.assertEqual(order.coupon_code, 'SAVE10')
+        self.assertEqual(float(order.discount_amount), 100.0)
+        self.assertEqual(float(order.total_amount), 900.0)
+        from .models import CouponRedemption, Coupon
+        redemption = CouponRedemption.objects.get(order=order)
+        self.assertEqual(redemption.status, 'pending')
+        self.assertEqual(Coupon.objects.get(code='SAVE10').total_used, 1)
+
+    def test_payment_verify_finalizes_redemption(self):
+        self._make_coupon(discount_type='fixed_amount', discount_value=Decimal('100'))
+        self.client.force_authenticate(user=self.user)
+        create = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }, format='json').json()
+        order_id = create['payment_order_id']
+        payment_id = 'pay_coupon_1'
+        signature = build_razorpay_signature(order_id, payment_id, 'test_razorpay_secret')
+        verify = self.client.post('/api/payments/verify/', {
+            'razorpay_order_id': order_id,
+            'razorpay_payment_id': payment_id,
+            'razorpay_signature': signature,
+            'amount': create['amount'],
+        }, format='json')
+        self.assertEqual(verify.status_code, status.HTTP_200_OK)
+        from .models import CouponRedemption
+        redemption = CouponRedemption.objects.get(order_id=create['order_id'])
+        self.assertEqual(redemption.status, 'redeemed')
+        self.assertIsNotNone(redemption.redeemed_at)
+
+    def test_checkout_revalidate_rejects_bad_coupon_after_cart_change(self):
+        self._make_coupon(minimum_order_amount=Decimal('1500'))
+        self.client.force_authenticate(user=self.user)
+        # Validate would fail for qty=1; payment create must also reject.
+        response = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_global_usage_limit(self):
+        self._make_coupon(usage_limit=1, discount_type='fixed_amount', discount_value=Decimal('50'))
+        self.client.force_authenticate(user=self.user)
+        first = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }, format='json')
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        other = User.objects.create_user(username='other_coupon', email='o@example.com', password='securepass123')
+        self.client.force_authenticate(user=other)
+        second = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **{**self._checkout_fields(), 'customer_email': 'o@example.com'},
+        }, format='json')
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_per_user_limit(self):
+        self._make_coupon(usage_limit_per_user=1, discount_type='fixed_amount', discount_value=Decimal('50'))
+        self.client.force_authenticate(user=self.user)
+        first = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }, format='json')
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        second = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }, format='json')
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_cancel_unpaid_voids_but_does_not_restore_per_user_by_default(self):
+        from django.conf import settings
+        self.assertFalse(getattr(settings, 'COUPON_RESTORE_ON_CANCEL', True))
+        self._make_coupon(usage_limit_per_user=1, usage_limit=10, discount_type='fixed_amount', discount_value=Decimal('50'))
+        self.client.force_authenticate(user=self.user)
+        create = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }, format='json').json()
+        from .models import Coupon, CouponRedemption
+        coupon = Coupon.objects.get(code='SAVE10')
+        self.assertEqual(coupon.total_used, 1)
+        cancel = self.client.post(f"/api/orders/{create['order_id']}/cancel/", {'reason': 'changed mind'}, format='json')
+        self.assertEqual(cancel.status_code, status.HTTP_200_OK)
+        coupon.refresh_from_db()
+        self.assertEqual(coupon.total_used, 0)  # global released
+        redemption = CouponRedemption.objects.get(order_id=create['order_id'])
+        self.assertEqual(redemption.status, 'voided')
+        # Per-user still blocked
+        again = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE10',
+            **self._checkout_fields(),
+        }, format='json')
+        self.assertEqual(again.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_customer_forbidden_on_admin_coupon_apis(self):
+        self._make_coupon()
+        self.client.force_authenticate(user=self.user)
+        list_resp = self.client.get('/api/admin/coupons/')
+        self.assertEqual(list_resp.status_code, status.HTTP_403_FORBIDDEN)
+        create_resp = self.client.post('/api/admin/coupons/', {
+            'code': 'HACK',
+            'discount_type': 'percentage',
+            'discount_value': 10,
+        }, format='json')
+        self.assertEqual(create_resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_coupon_crud(self):
+        self.client.force_authenticate(user=self.admin)
+        create = self.client.post('/api/admin/coupons/', {
+            'code': 'admin20',
+            'name': 'Admin 20',
+            'discount_type': 'percentage',
+            'discount_value': '20',
+            'is_active': True,
+            'applies_to': 'all',
+        }, format='json')
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED)
+        coupon_id = create.json()['id']
+        self.assertEqual(create.json()['code'], 'ADMIN20')
+        patch = self.client.patch(f'/api/admin/coupons/{coupon_id}/', {'is_active': False}, format='json')
+        self.assertEqual(patch.status_code, status.HTTP_200_OK)
+        self.assertFalse(patch.json()['is_active'])
+        listing = self.client.get('/api/admin/coupons/')
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(listing.json()['count'], 1)
+
+    def test_admin_rejects_negative_and_bad_pct(self):
+        self.client.force_authenticate(user=self.admin)
+        bad_pct = self.client.post('/api/admin/coupons/', {
+            'code': 'BADPCT',
+            'discount_type': 'percentage',
+            'discount_value': '150',
+        }, format='json')
+        self.assertEqual(bad_pct.status_code, status.HTTP_400_BAD_REQUEST)
+        bad_neg = self.client.post('/api/admin/coupons/', {
+            'code': 'BADNEG',
+            'discount_type': 'fixed_amount',
+            'discount_value': '-5',
+        }, format='json')
+        self.assertEqual(bad_neg.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class CouponConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        from .models import Coupon
+        self.Coupon = Coupon
+        self.product = Product.objects.create(
+            name='Concurrent Cake',
+            category='Birthday Cakes',
+            price=Decimal('500.00'),
+            discount=0,
+            availability='in_stock',
+            status='published',
+            is_active=True,
+            available_quantity=50,
+        )
+        self.Coupon.objects.create(
+            code='ONCE',
+            discount_type='fixed_amount',
+            discount_value=Decimal('50'),
+            usage_limit=1,
+            is_active=True,
+            applies_to='all',
+        )
+
+    def test_concurrent_global_limit(self):
+        """
+        SQLite cannot reliably run threaded HTTP against one DB file (table locked).
+        Assert the atomic conditional total_used increment used by reserve_coupon_for_order
+        only allows usage_limit successes.
+        """
+        from django.db import transaction
+        from django.db.models import F
+        from .models import Coupon, CouponRedemption, Order
+        from . import coupons as coupon_service
+
+        coupon = Coupon.objects.get(code='ONCE')
+        users = [
+            User.objects.create_user(username=f'cuser{i}', email=f'c{i}@example.com', password='securepass123')
+            for i in range(2)
+        ]
+        successes = 0
+        failures = 0
+        for i, user in enumerate(users):
+            order = Order.objects.create(
+                user=user,
+                order_number=f'PB-CONCUR-{i}-{user.id}',
+                customer_name=user.username,
+                customer_email=user.email,
+                customer_mobile='9876543210',
+                shipping_address='12 Market Road',
+                city='Mumbai',
+                state='Maharashtra',
+                postal_code='400001',
+                country='India',
+                subtotal_amount=Decimal('500.00'),
+                total_amount=Decimal('500.00'),
+                status='PENDING',
+                payment_status='pending',
+            )
+            cart_rows = [{
+                'product': self.product,
+                'quantity': 1,
+                'unit_price': self.product.discounted_price,
+            }]
+            try:
+                with transaction.atomic():
+                    coupon_service.reserve_coupon_for_order(user, 'ONCE', cart_rows, order)
+                successes += 1
+            except Exception:
+                failures += 1
+
+        coupon.refresh_from_db()
+        self.assertEqual(successes, 1)
+        self.assertEqual(failures, 1)
+        self.assertEqual(coupon.total_used, 1)
+        self.assertEqual(CouponRedemption.objects.filter(coupon=coupon, status='pending').count(), 1)
+
+
+
+class AddressDeliveryAPITests(TestCase):
+    def setUp(self):
+        from accounts.models import CustomerAddress
+        from .models import DeliveryZone, DeliverySettings, Coupon
+
+        self.CustomerAddress = CustomerAddress
+        self.DeliveryZone = DeliveryZone
+        self.DeliverySettings = DeliverySettings
+        self.Coupon = Coupon
+        self.client = APIClient()
+        self.user = User.objects.create_user(username='addr_user', email='addr@example.com', password='securepass123')
+        self.other = User.objects.create_user(username='addr_other', email='other@example.com', password='securepass123')
+        self.admin = User.objects.create_user(username='addr_admin', password='securepass123', is_staff=True)
+        self.product = Product.objects.create(
+            name='Delivery Cake',
+            category='Birthday Cakes',
+            price=Decimal('500.00'),
+            discount=0,
+            availability='in_stock',
+            status='published',
+            is_active=True,
+            available_quantity=50,
+        )
+        self.settings = DeliverySettings.get_solo()
+        self.settings.delivery_enabled = True
+        self.settings.default_delivery_charge = Decimal('0.00')
+        self.settings.bakery_latitude = Decimal('19.076000')
+        self.settings.bakery_longitude = Decimal('72.877700')
+        self.settings.max_delivery_radius_km = Decimal('15.00')
+        self.settings.per_km_charge = None
+        self.settings.free_delivery_threshold = None
+        self.settings.save()
+        self.zone = DeliveryZone.objects.create(
+            name='South Mumbai',
+            postal_codes=['400001', '400002'],
+            is_active=True,
+            delivery_charge=Decimal('50.00'),
+            minimum_order_amount=Decimal('0.00'),
+            free_delivery_threshold=Decimal('1000.00'),
+            eta_min_minutes=30,
+            eta_max_minutes=60,
+        )
+
+    def _addr_payload(self, **kwargs):
+        data = {
+            'full_name': 'Addr User',
+            'mobile_number': '9876543210',
+            'address_line_1': '12 Market Road',
+            'address_line_2': 'Near Station',
+            'landmark': 'Scout Camp',
+            'city': 'Mumbai',
+            'state': 'Maharashtra',
+            'postal_code': '400001',
+            'country': 'India',
+            'latitude': '19.080000',
+            'longitude': '72.880000',
+            'address_type': 'HOME',
+            'is_default': True,
+        }
+        data.update(kwargs)
+        return data
+
+    def _checkout_fields(self, **kwargs):
+        data = {
+            'customer_name': 'Addr User',
+            'customer_email': 'addr@example.com',
+            'customer_mobile': '9876543210',
+            'shipping_address': '12 Market Road',
+            'city': 'Mumbai',
+            'state': 'Maharashtra',
+            'postal_code': '400001',
+            'country': 'India',
+            'shipping_latitude': '19.080000',
+            'shipping_longitude': '72.880000',
+        }
+        data.update(kwargs)
+        return data
+
+    def test_address_crud_and_default_swap(self):
+        self.client.force_authenticate(user=self.user)
+        r1 = self.client.post('/api/addresses/', self._addr_payload(), format='json')
+        self.assertEqual(r1.status_code, status.HTTP_201_CREATED)
+        a1 = r1.json()
+        self.assertTrue(a1['is_default'])
+        self.assertEqual(a1['postal_code'], '400001')
+
+        r2 = self.client.post('/api/addresses/', self._addr_payload(
+            full_name='Work Addr', postal_code='400002', is_default=True, address_type='WORK',
+        ), format='json')
+        self.assertEqual(r2.status_code, status.HTTP_201_CREATED)
+        a2 = r2.json()
+        self.assertTrue(a2['is_default'])
+        a1_refreshed = self.client.get(f"/api/addresses/{a1['id']}/").json()
+        self.assertFalse(a1_refreshed['is_default'])
+
+        set_def = self.client.post(f"/api/addresses/{a1['id']}/set-default/")
+        self.assertEqual(set_def.status_code, status.HTTP_200_OK)
+        self.assertTrue(set_def.json()['is_default'])
+
+        listing = self.client.get('/api/addresses/')
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        self.assertEqual(listing.json()['count'], 2)
+
+        patched = self.client.patch(f"/api/addresses/{a1['id']}/", {'landmark': 'Updated'}, format='json')
+        self.assertEqual(patched.status_code, status.HTTP_200_OK)
+        self.assertEqual(patched.json()['landmark'], 'Updated')
+
+        deleted = self.client.delete(f"/api/addresses/{a2['id']}/")
+        self.assertEqual(deleted.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_address_idor_forbidden(self):
+        self.client.force_authenticate(user=self.user)
+        created = self.client.post('/api/addresses/', self._addr_payload(), format='json').json()
+        self.client.force_authenticate(user=self.other)
+        resp = self.client.get(f"/api/addresses/{created['id']}/")
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        resp = self.client.patch(f"/api/addresses/{created['id']}/", {'city': 'Pune'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        resp = self.client.delete(f"/api/addresses/{created['id']}/")
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_invalid_postal_and_mobile(self):
+        self.client.force_authenticate(user=self.user)
+        bad_pin = self.client.post('/api/addresses/', self._addr_payload(postal_code='123'), format='json')
+        self.assertEqual(bad_pin.status_code, status.HTTP_400_BAD_REQUEST)
+        bad_mobile = self.client.post('/api/addresses/', self._addr_payload(mobile_number='12345'), format='json')
+        self.assertEqual(bad_mobile.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_supported_and_unsupported_pin(self):
+        self.client.force_authenticate(user=self.user)
+        ok = self.client.post('/api/delivery/quote/', {
+            'postal_code': '400001',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(ok.status_code, status.HTTP_200_OK)
+        self.assertTrue(ok.json()['eligible'])
+        self.assertEqual(ok.json()['delivery_fee'], 50.0)
+
+        bad = self.client.post('/api/delivery/quote/', {
+            'postal_code': '999999',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(bad.status_code, status.HTTP_200_OK)
+        self.assertFalse(bad.json()['eligible'])
+
+    def test_min_order_and_free_delivery(self):
+        self.zone.minimum_order_amount = Decimal('600.00')
+        self.zone.save()
+        self.client.force_authenticate(user=self.user)
+        # product 500 < 600
+        low = self.client.post('/api/delivery/quote/', {
+            'postal_code': '400001',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+        }, format='json')
+        self.assertFalse(low.json()['eligible'])
+        self.assertFalse(low.json()['min_order_ok'])
+
+        self.zone.minimum_order_amount = Decimal('0')
+        self.zone.save()
+        # 2 x 500 = 1000 >= free threshold
+        free = self.client.post('/api/delivery/quote/', {
+            'postal_code': '400001',
+            'items': [{'id': self.product.id, 'quantity': 2}],
+        }, format='json')
+        self.assertTrue(free.json()['eligible'])
+        self.assertEqual(free.json()['delivery_fee'], 0.0)
+        self.assertTrue(free.json()['free_delivery_applied'])
+
+    def test_payment_includes_delivery_and_coupon_merchandise_only(self):
+        coupon = self.Coupon.objects.create(
+            code='SAVE50',
+            name='Save 50',
+            discount_type='fixed',
+            discount_value=Decimal('50'),
+            is_active=True,
+            applies_to='all',
+        )
+        self.client.force_authenticate(user=self.user)
+        # subtotal 500, coupon 50 -> 450, delivery 50 -> total 500
+        resp = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'coupon_code': 'SAVE50',
+            **self._checkout_fields(),
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        # amount is paise
+        self.assertEqual(resp.json()['amount'], 50000)
+        self.assertEqual(resp.json()['delivery_fee'], 50.0)
+        order = Order.objects.get(id=resp.json()['order_id'])
+        self.assertEqual(order.delivery_fee, Decimal('50.00'))
+        self.assertEqual(order.discount_amount, Decimal('50.00'))
+        self.assertEqual(order.total_amount, Decimal('500.00'))
+        self.assertEqual(order.delivery_zone_id, self.zone.id)
+
+    def test_payment_with_address_id_snapshots_and_survives_delete(self):
+        self.client.force_authenticate(user=self.user)
+        addr = self.client.post('/api/addresses/', self._addr_payload(), format='json').json()
+        resp = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'address_id': addr['id'],
+            'customer_email': 'addr@example.com',
+            'customer_name': 'Addr User',
+            'customer_mobile': '9876543210',
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        order = Order.objects.get(id=resp.json()['order_id'])
+        self.assertEqual(order.shipping_address, '12 Market Road')
+        self.assertEqual(order.postal_code, '400001')
+        self.assertEqual(order.landmark, 'Scout Camp')
+        self.assertIsNotNone(order.shipping_latitude)
+        self.assertEqual(order.address_id, addr['id'])
+        self.client.delete(f"/api/addresses/{addr['id']}/")
+        order.refresh_from_db()
+        self.assertIsNone(order.address_id)
+        self.assertEqual(order.shipping_address, '12 Market Road')
+        self.assertEqual(float(order.delivery_fee), 50.0)
+
+    def test_zone_disabled_rejects(self):
+        self.zone.is_active = False
+        self.zone.save()
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post('/api/payments/create/', {
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            **self._checkout_fields(),
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_radius_rejection(self):
+        self.client.force_authenticate(user=self.user)
+        # Far coords ~100+ km from bakery
+        resp = self.client.post('/api/delivery/quote/', {
+            'postal_code': '400001',
+            'items': [{'id': self.product.id, 'quantity': 1}],
+            'shipping_latitude': '28.613900',
+            'shipping_longitude': '77.209000',
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertFalse(resp.json()['eligible'])
+        self.assertIn('radius', resp.json()['message'].lower())
+
+    def test_customer_forbidden_on_admin_zones(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.get('/api/admin/delivery-zones/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        resp = self.client.get('/api/admin/delivery-settings/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_zone_crud_and_settings(self):
+        self.client.force_authenticate(user=self.admin)
+        created = self.client.post('/api/admin/delivery-zones/', {
+            'name': 'Andheri',
+            'postal_codes': ['400053', '400058'],
+            'delivery_charge': '40.00',
+            'minimum_order_amount': '100.00',
+            'is_active': True,
+        }, format='json')
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.content)
+        zone_id = created.json()['id']
+        patched = self.client.patch(f'/api/admin/delivery-zones/{zone_id}/', {'is_active': False}, format='json')
+        self.assertEqual(patched.status_code, status.HTTP_200_OK)
+        self.assertFalse(patched.json()['is_active'])
+
+        settings_get = self.client.get('/api/admin/delivery-settings/')
+        self.assertEqual(settings_get.status_code, status.HTTP_200_OK)
+        settings_patch = self.client.patch('/api/admin/delivery-settings/', {
+            'per_km_charge': '5.00',
+            'max_delivery_radius_km': '20.00',
+        }, format='json')
+        self.assertEqual(settings_patch.status_code, status.HTTP_200_OK)
+        self.assertEqual(float(settings_patch.json()['per_km_charge']), 5.0)
 

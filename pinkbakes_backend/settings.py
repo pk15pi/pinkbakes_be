@@ -65,6 +65,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'accounts',
     'catalog',
+    'notifications',
 ]
 
 MIDDLEWARE = [
@@ -166,3 +167,19 @@ ALLOWED_HOSTS = ['*']
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Coupons: when False (default), voided redemptions still count toward
+# usage_limit_per_user after unpaid cancel (anti-abuse). Global usage_limit
+# is always released on unpaid cancel so abandoned carts do not burn limits.
+COUPON_RESTORE_ON_CANCEL = os.environ.get('COUPON_RESTORE_ON_CANCEL', 'false').lower() in ('1', 'true', 'yes', 'on')
+
+
+# Notifications (extends existing email stack; SMS/WhatsApp optional)
+NOTIFICATION_EMAIL_ENABLED = os.environ.get('NOTIFICATION_EMAIL_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+SMS_PROVIDER = os.environ.get('SMS_PROVIDER', '')
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '')
+TWILIO_FROM_NUMBER = os.environ.get('TWILIO_FROM_NUMBER', '')
+WHATSAPP_API_URL = os.environ.get('WHATSAPP_API_URL', '')
+WHATSAPP_TOKEN = os.environ.get('WHATSAPP_TOKEN', '')
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get('WHATSAPP_PHONE_NUMBER_ID', '')

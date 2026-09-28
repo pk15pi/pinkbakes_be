@@ -49,6 +49,7 @@ def sync_availability(product, save=True):
     """Derive availability enum from available_quantity. Does not touch status."""
     available = get_available(product)
     threshold = int(getattr(product, 'low_stock_threshold', None) or default_low_stock_threshold())
+    previous = getattr(product, 'availability', None) or ''
     if available <= 0:
         new_value = 'out_of_stock'
     elif available <= threshold:
@@ -59,6 +60,13 @@ def sync_availability(product, save=True):
         product.availability = new_value
         if save:
             product.save(update_fields=['availability', 'updated_at'])
+        # Alert only when crossing into low_stock from a healthier state.
+        if new_value == 'low_stock' and previous in ('in_stock', '', None):
+            try:
+                from notifications.service import notify_low_stock
+                notify_low_stock(product, previous_availability=previous or '')
+            except Exception:
+                pass
     return product.availability
 
 

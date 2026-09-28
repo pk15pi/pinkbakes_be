@@ -16,7 +16,8 @@ from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .email_service import build_password_reset_email_html, build_verification_email_html, send_html_email
+from notifications import events as notification_events
+from notifications.service import notify as notify_event
 from .models import PasswordResetToken, UserProfile
 from .serializers import SigninSerializer, SignupSerializer
 
@@ -79,8 +80,31 @@ class SignupView(APIView):
             user, profile = serializer.save()
             token, _ = Token.objects.get_or_create(user=user)
             verification_url = _verification_link(profile.verification_token)
-            email_html = build_verification_email_html(user.first_name or user.username, verification_url)
-            send_html_email('Verify Your PinkBakes Account', [user.email], email_html)
+            try:
+                notify_event(
+                    notification_events.EMAIL_VERIFICATION_REQUIRED,
+                    user=user,
+                    email=user.email,
+                    context={
+                        'user_name': user.first_name or user.username,
+                        'verification_url': verification_url,
+                        'message': 'Please verify your PinkBakes account.',
+                    },
+                    idempotency_key=f'email_verify:{user.pk}:{profile.verification_token[:12]}',
+                    reference_type='user',
+                    reference_id=str(user.pk),
+                )
+                notify_event(
+                    notification_events.USER_REGISTERED,
+                    user=user,
+                    context={'message': 'Welcome to PinkBakes!', 'title': 'Welcome'},
+                    channels=['in_app'],
+                    idempotency_key=f'user_registered:{user.pk}',
+                    reference_type='user',
+                    reference_id=str(user.pk),
+                )
+            except Exception:
+                pass
             return Response(
                 {
                     'message': 'Account created successfully. Please verify your email or mobile number before you can sign in.',
@@ -162,12 +186,38 @@ class SendVerificationView(APIView):
         profile.otp_last_sent_at = now
         profile.save()
 
-        email_html = build_verification_email_html(user.first_name or user.username, _verification_link(profile.verification_token))
-        send_html_email(
-            'Verify Your PinkBakes Account',
-            [user.email],
-            email_html,
-        )
+        verification_url = _verification_link(profile.verification_token)
+        try:
+            notify_event(
+                notification_events.EMAIL_VERIFICATION_REQUIRED,
+                user=user,
+                email=user.email,
+                context={
+                    'user_name': user.first_name or user.username,
+                    'verification_url': verification_url,
+                    'message': 'Please verify your PinkBakes account.',
+                },
+                force=True,
+                reference_type='user',
+                reference_id=str(user.pk),
+            )
+            if method == 'mobile':
+                notify_event(
+                    notification_events.MOBILE_VERIFICATION_REQUIRED,
+                    user=user,
+                    phone=getattr(profile, 'mobile_number', '') or '',
+                    context={
+                        'user_name': user.first_name or user.username,
+                        'verification_url': verification_url,
+                        'message': 'Mobile verification code generated.',
+                    },
+                    channels=['sms', 'in_app'],
+                    force=True,
+                    reference_type='user',
+                    reference_id=str(user.pk),
+                )
+        except Exception:
+            pass
 
         return Response(
             {
@@ -301,6 +351,20 @@ class RequestLoginOtpView(APIView):
         profile.otp_last_sent_at = timezone.now()
         profile.save(update_fields=['otp_code', 'otp_hash', 'otp_created_at', 'otp_expires_at', 'otp_attempts', 'otp_last_sent_at'])
 
+        try:
+            notify_event(
+                notification_events.LOGIN_OTP_REQUESTED,
+                user=user,
+                phone=profile.mobile_number,
+                context={'message': 'Your PinkBakes login OTP is ready.', 'title': 'Login OTP'},
+                channels=['sms', 'in_app'],
+                force=True,
+                reference_type='user',
+                reference_id=str(user.pk),
+            )
+        except Exception:
+            pass
+
         return Response({
             'message': f'OTP sent successfully. Use the code {otp} to sign in.',
             'otp': otp,
@@ -387,8 +451,22 @@ class ForgotPasswordView(APIView):
             )
 
             reset_url = _password_reset_link(token)
-            html_body = build_password_reset_email_html(user.first_name or user.username, reset_url)
-            send_html_email('Reset Your PinkBakes Password', [user.email], html_body)
+            try:
+                notify_event(
+                    notification_events.PASSWORD_RESET_REQUESTED,
+                    user=user,
+                    email=user.email,
+                    context={
+                        'user_name': user.first_name or user.username,
+                        'reset_url': reset_url,
+                        'message': 'Password reset requested.',
+                    },
+                    force=True,
+                    reference_type='user',
+                    reference_id=str(user.pk),
+                )
+            except Exception:
+                pass
 
         return Response({
             'message': 'If an account exists with this email address, a password reset link has been sent.'
@@ -449,6 +527,20 @@ class ResetPasswordView(APIView):
         reset_token.save(update_fields=['used_at'])
 
         PasswordResetToken.objects.filter(user=user, used_at__isnull=True).update(used_at=timezone.now())
+
+        try:
+            notify_event(
+                notification_events.PASSWORD_CHANGED,
+                user=user,
+                email=user.email,
+                context={'user_name': user.first_name or user.username, 'message': 'Your password was changed.'},
+                force=True,
+                idempotency_key=f'password_changed:{user.pk}:{int(timezone.now().timestamp())}',
+                reference_type='user',
+                reference_id=str(user.pk),
+            )
+        except Exception:
+            pass
 
         return Response({'message': 'Your password has been reset successfully.'}, status=status.HTTP_200_OK)
 

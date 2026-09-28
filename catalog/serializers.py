@@ -2,7 +2,7 @@ from django.db.models import Avg
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from .models import DeliveryLocation, Employee, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review
+from .models import Coupon, CouponRedemption, DeliveryLocation, Employee, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review, DeliveryZone, DeliverySettings
 
 
 class EmployeeSerializer(serializers.ModelSerializer):
@@ -104,14 +104,25 @@ class OrderSerializer(serializers.ModelSerializer):
             'customer_mobile',
             'shipping_address',
             'shipping_address_2',
+            'landmark',
             'city',
             'state',
             'postal_code',
             'country',
+            'shipping_latitude',
+            'shipping_longitude',
+            'address',
+            'delivery_zone',
             'subtotal_amount',
+            'discount_amount',
             'delivery_fee',
             'tax_amount',
             'total_amount',
+            'coupon',
+            'coupon_code',
+            'coupon_discount_type',
+            'coupon_discount_value',
+            'coupon_discount_amount',
             'status',
             'payment_status',
             'delivery_employee',
@@ -422,3 +433,172 @@ class ProductSerializer(serializers.ModelSerializer):
             if 'available_quantity' in validated_data or 'low_stock_threshold' in validated_data:
                 sync_availability(instance, save=True)
         return instance
+
+
+class CouponSerializer(serializers.ModelSerializer):
+    product_ids = serializers.PrimaryKeyRelatedField(
+        source='products', many=True, queryset=Product.objects.all(), required=False,
+    )
+
+    class Meta:
+        model = Coupon
+        fields = [
+            'id',
+            'code',
+            'name',
+            'description',
+            'discount_type',
+            'discount_value',
+            'minimum_order_amount',
+            'maximum_discount_amount',
+            'start_at',
+            'end_at',
+            'usage_limit',
+            'usage_limit_per_user',
+            'total_used',
+            'is_active',
+            'applies_to',
+            'product_ids',
+            'category_names',
+            'exclude_already_discounted',
+            'new_customers_only',
+            'created_by',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'total_used', 'created_by', 'created_at', 'updated_at']
+
+    def validate_code(self, value):
+        value = (value or '').strip().upper()
+        if not value:
+            raise serializers.ValidationError('Coupon code is required.')
+        qs = Coupon.objects.filter(code=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError('A coupon with this code already exists.')
+        return value
+
+    def validate_discount_value(self, value):
+        if value is None or value < 0:
+            raise serializers.ValidationError('Discount value cannot be negative.')
+        return value
+
+    def validate_minimum_order_amount(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError('Minimum order amount cannot be negative.')
+        return value
+
+    def validate_maximum_discount_amount(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError('Maximum discount cannot be negative.')
+        return value
+
+    def validate(self, attrs):
+        discount_type = attrs.get('discount_type', getattr(self.instance, 'discount_type', 'percentage'))
+        discount_value = attrs.get('discount_value', getattr(self.instance, 'discount_value', None))
+        start_at = attrs.get('start_at', getattr(self.instance, 'start_at', None))
+        end_at = attrs.get('end_at', getattr(self.instance, 'end_at', None))
+        if discount_type == 'percentage' and discount_value is not None and discount_value > 100:
+            raise serializers.ValidationError({'discount_value': 'Percentage discount cannot exceed 100.'})
+        if start_at and end_at and end_at < start_at:
+            raise serializers.ValidationError({'end_at': 'end_at must be greater than or equal to start_at.'})
+        applies_to = attrs.get('applies_to', getattr(self.instance, 'applies_to', 'all'))
+        if applies_to == 'categories':
+            names = attrs.get('category_names', getattr(self.instance, 'category_names', []) or [])
+            if not names:
+                raise serializers.ValidationError({'category_names': 'Provide at least one category name.'})
+        return attrs
+
+    def create(self, validated_data):
+        products = validated_data.pop('products', [])
+        request = self.context.get('request')
+        if request and request.user and request.user.is_authenticated:
+            validated_data['created_by'] = request.user
+        coupon = Coupon.objects.create(**validated_data)
+        if products:
+            coupon.products.set(products)
+        return coupon
+
+    def update(self, instance, validated_data):
+        products = validated_data.pop('products', None)
+        for key, value in validated_data.items():
+            setattr(instance, key, value)
+        instance.save()
+        if products is not None:
+            instance.products.set(products)
+        return instance
+
+
+class CouponRedemptionSerializer(serializers.ModelSerializer):
+    coupon_code = serializers.CharField(source='coupon.code', read_only=True)
+    username = serializers.CharField(source='user.username', read_only=True)
+    order_number = serializers.CharField(source='order.order_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = CouponRedemption
+        fields = [
+            'id',
+            'coupon',
+            'coupon_code',
+            'user',
+            'username',
+            'order',
+            'order_number',
+            'discount_amount',
+            'status',
+            'created_at',
+            'redeemed_at',
+        ]
+        read_only_fields = fields
+
+
+class DeliveryZoneSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DeliveryZone
+        fields = [
+            'id',
+            'name',
+            'postal_codes',
+            'city',
+            'state',
+            'is_active',
+            'delivery_charge',
+            'minimum_order_amount',
+            'free_delivery_threshold',
+            'eta_min_minutes',
+            'eta_max_minutes',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_postal_codes(self, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError('postal_codes must be a list of PIN strings.')
+        cleaned = []
+        for raw in value:
+            pin = ''.join(ch for ch in str(raw) if ch.isdigit())
+            if len(pin) != 6:
+                raise serializers.ValidationError(f'Invalid PIN in postal_codes: {raw}')
+            cleaned.append(pin)
+        return cleaned
+
+
+class DeliverySettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DeliverySettings
+        fields = [
+            'delivery_enabled',
+            'default_delivery_charge',
+            'free_delivery_threshold',
+            'bakery_latitude',
+            'bakery_longitude',
+            'max_delivery_radius_km',
+            'per_km_charge',
+            'updated_at',
+        ]
+        read_only_fields = ['updated_at']
+

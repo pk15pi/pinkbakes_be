@@ -46,3 +46,46 @@ class UserProfile(models.Model):
 
     def __str__(self):
         return f"{self.user.username} profile"
+
+
+class CustomerAddress(models.Model):
+    ADDRESS_TYPE_CHOICES = [
+        ('HOME', 'Home'),
+        ('WORK', 'Work'),
+        ('OTHER', 'Other'),
+    ]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='addresses')
+    full_name = models.CharField(max_length=120)
+    mobile_number = models.CharField(max_length=20, blank=True, default='')
+    address_line_1 = models.CharField(max_length=255)
+    address_line_2 = models.CharField(max_length=255, blank=True, default='')
+    landmark = models.CharField(max_length=120, blank=True, default='')
+    city = models.CharField(max_length=80)
+    state = models.CharField(max_length=80)
+    postal_code = models.CharField(max_length=20)
+    country = models.CharField(max_length=80, default='India')
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    address_type = models.CharField(max_length=10, choices=ADDRESS_TYPE_CHOICES, default='HOME')
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-is_default', '-updated_at']
+        indexes = [
+            models.Index(fields=['user', 'is_default']),
+            models.Index(fields=['user', 'postal_code']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user'],
+                condition=models.Q(is_default=True),
+                name='accounts_customeraddress_one_default_per_user',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.full_name} ({self.postal_code})'
+

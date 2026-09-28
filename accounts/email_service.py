@@ -83,19 +83,73 @@ def build_password_reset_email_html(user_name, reset_url):
 def build_order_confirmation_email_html(order):
     customer_name = (getattr(order, 'customer_name', None) or 'there').strip() or 'there'
     order_number = getattr(order, 'order_number', '')
+    created_at = getattr(order, 'created_at', None)
+    try:
+        order_date = created_at.strftime('%d %b %Y, %I:%M %p') if created_at else ''
+    except Exception:
+        order_date = str(created_at or '')
     total_amount = getattr(order, 'total_amount', 0)
+    subtotal_amount = getattr(order, 'subtotal_amount', 0)
+    discount_amount = getattr(order, 'discount_amount', 0) or getattr(order, 'coupon_discount_amount', 0) or 0
+    coupon_discount = getattr(order, 'coupon_discount_amount', 0) or 0
+    coupon_code = (getattr(order, 'coupon_code', None) or '').strip()
+    delivery_fee = getattr(order, 'delivery_fee', 0) or 0
+    tax_amount = getattr(order, 'tax_amount', 0) or 0
+    payment_status = getattr(order, 'payment_status', '') or ''
+    order_status = getattr(order, 'status', '') or ''
+    shipping_address = getattr(order, 'shipping_address', '') or ''
+    shipping_address_2 = getattr(order, 'shipping_address_2', '') or ''
+    landmark = getattr(order, 'landmark', '') or ''
+    city = getattr(order, 'city', '') or ''
+    state = getattr(order, 'state', '') or ''
+    postal_code = getattr(order, 'postal_code', '') or ''
+    country = getattr(order, 'country', '') or ''
+    eta = getattr(order, 'estimated_delivery_at', None) or getattr(order, 'eta', None) or ''
+    try:
+        eta_text = eta.strftime('%d %b %Y, %I:%M %p') if hasattr(eta, 'strftime') else (str(eta) if eta else '')
+    except Exception:
+        eta_text = ''
+
     items_mgr = getattr(order, 'items', None)
     items = list(items_mgr.all()) if items_mgr is not None and hasattr(items_mgr, 'all') else []
     item_rows = ''
     for item in items:
+        unit = getattr(item, 'unit_price', None)
+        qty = getattr(item, 'quantity', 1)
+        sub = getattr(item, 'subtotal', 0)
+        name = getattr(item, 'product_name', 'Item')
+        price_bit = f" @ Rs.{unit}" if unit is not None else ''
         item_rows += (
             f"<tr>"
-            f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8;'>{item.product_name} x {item.quantity}</td>"
-            f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8; text-align:right;'>Rs.{item.subtotal}</td>"
+            f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8;'>{name}</td>"
+            f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8; text-align:center;'>{qty}{price_bit}</td>"
+            f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8; text-align:right;'>Rs.{sub}</td>"
             f"</tr>"
         )
     if not item_rows:
-        item_rows = "<tr><td colspan='2' style='padding:8px 0;'>Your order items are being prepared.</td></tr>"
+        item_rows = "<tr><td colspan='3' style='padding:8px 0;'>Your order items are being prepared.</td></tr>"
+
+    address_lines = '<br>'.join(
+        part for part in [
+            shipping_address,
+            shipping_address_2,
+            f'Landmark: {landmark}' if landmark else '',
+            ', '.join(p for p in [city, state, postal_code] if p),
+            country,
+        ] if part
+    )
+
+    discount_block = ''
+    if coupon_code or float(discount_amount or 0) > 0 or float(coupon_discount or 0) > 0:
+        shown = coupon_discount or discount_amount
+        coupon_label = f' ({coupon_code})' if coupon_code else ''
+        discount_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Discount{coupon_label}:</strong> -Rs.{shown}</p>"
+
+    delivery_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Delivery charge:</strong> Rs.{delivery_fee}</p>"
+    tax_block = ''
+    if float(tax_amount or 0) > 0:
+        tax_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Tax:</strong> Rs.{tax_amount}</p>"
+    eta_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Estimated delivery:</strong> {eta_text}</p>" if eta_text else ''
 
     return f"""
     <html>
@@ -109,11 +163,25 @@ def build_order_confirmation_email_html(order):
             <p style="font-size:15px; line-height:1.6; margin:0 0 20px;">
               Thank you for your order! Your payment was successful and your order is confirmed.
             </p>
-            <p style="font-size:15px; margin:0 0 8px;"><strong>Order number:</strong> {order_number}</p>
-            <p style="font-size:15px; margin:0 0 16px;"><strong>Total paid:</strong> Rs.{total_amount}</p>
+            <p style="font-size:15px; margin:0 0 6px;"><strong>Order number:</strong> {order_number}</p>
+            <p style="font-size:15px; margin:0 0 6px;"><strong>Order date:</strong> {order_date}</p>
+            <p style="font-size:15px; margin:0 0 6px;"><strong>Payment status:</strong> {payment_status}</p>
+            <p style="font-size:15px; margin:0 0 16px;"><strong>Order status:</strong> {order_status}</p>
             <table style="width:100%; border-collapse:collapse; margin:16px 0 8px; font-size:14px;">
+              <tr>
+                <th style="text-align:left; padding:8px 0; border-bottom:2px solid #f2dfe8;">Product</th>
+                <th style="text-align:center; padding:8px 0; border-bottom:2px solid #f2dfe8;">Qty / Price</th>
+                <th style="text-align:right; padding:8px 0; border-bottom:2px solid #f2dfe8;">Subtotal</th>
+              </tr>
               {item_rows}
             </table>
+            <p style="font-size:14px; margin:12px 0 6px;"><strong>Subtotal:</strong> Rs.{subtotal_amount}</p>
+            {discount_block}
+            {delivery_block}
+            {tax_block}
+            <p style="font-size:16px; margin:8px 0 16px;"><strong>Total paid:</strong> Rs.{total_amount}</p>
+            <p style="font-size:14px; margin:0 0 6px;"><strong>Delivery address:</strong><br>{address_lines}</p>
+            {eta_block}
             <p style="font-size:14px; line-height:1.6; color:#5d4753; margin:20px 0 0;">
               We will notify you as your cake moves through preparation and delivery.
             </p>
@@ -136,7 +204,7 @@ def send_order_confirmation_email(order):
     if not recipient:
         return 0
 
-    subject = f"Order Confirmed — {getattr(order, 'order_number', 'PinkBakes')}"
+    subject = f"Order Confirmed - {getattr(order, 'order_number', 'PinkBakes')}"
     html_content = build_order_confirmation_email_html(order)
     return send_html_email(subject, [recipient], html_content)
 
@@ -180,7 +248,7 @@ def send_order_cancellation_email(order, reason=''):
     recipient = _order_recipient(order)
     if not recipient:
         return 0
-    subject = f"Order Cancelled — {getattr(order, 'order_number', 'PinkBakes')}"
+    subject = f"Order Cancelled - {getattr(order, 'order_number', 'PinkBakes')}"
     html_content = build_order_cancellation_email_html(order, reason=reason or getattr(order, 'cancellation_reason', '') or '')
     return send_html_email(subject, [recipient], html_content)
 
@@ -220,7 +288,7 @@ def send_refund_initiated_email(order, refund):
     recipient = _order_recipient(order)
     if not recipient:
         return 0
-    subject = f"Refund Initiated — {getattr(order, 'order_number', 'PinkBakes')}"
+    subject = f"Refund Initiated - {getattr(order, 'order_number', 'PinkBakes')}"
     return send_html_email(subject, [recipient], build_refund_email_html(order, refund, stage='initiated'))
 
 
@@ -228,7 +296,7 @@ def send_refund_completed_email(order, refund):
     recipient = _order_recipient(order)
     if not recipient:
         return 0
-    subject = f"Refund Completed — {getattr(order, 'order_number', 'PinkBakes')}"
+    subject = f"Refund Completed - {getattr(order, 'order_number', 'PinkBakes')}"
     return send_html_email(subject, [recipient], build_refund_email_html(order, refund, stage='completed'))
 
 
@@ -236,5 +304,5 @@ def send_refund_failed_email(order, refund):
     recipient = _order_recipient(order)
     if not recipient:
         return 0
-    subject = f"Refund Update — {getattr(order, 'order_number', 'PinkBakes')}"
+    subject = f"Refund Update - {getattr(order, 'order_number', 'PinkBakes')}"
     return send_html_email(subject, [recipient], build_refund_email_html(order, refund, stage='failed'))
