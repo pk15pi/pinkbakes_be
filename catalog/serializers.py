@@ -1,4 +1,4 @@
-from django.db.models import Avg
+from django.db.models import Avg, Count
 from django.utils.text import slugify
 from rest_framework import serializers
 
@@ -333,14 +333,24 @@ class ProductSerializer(serializers.ModelSerializer):
         return float(obj.discounted_price.quantize(__import__('decimal').Decimal('0.01')))
 
     def get_reviews(self, obj):
+        # Prefer prefetched reviews when present (detail views); else query.
+        reviews = getattr(obj, '_prefetched_objects_cache', {}).get('reviews')
+        if reviews is not None:
+            approved = [r for r in reviews if r.status == 'approved']
+            approved.sort(key=lambda r: r.created_at, reverse=True)
+            return ReviewSerializer(approved, many=True).data
         return ReviewSerializer(obj.reviews.filter(status='approved').order_by('-created_at'), many=True).data
 
     def get_average_rating(self, obj):
+        if hasattr(obj, 'annotated_average_rating'):
+            return float(obj.annotated_average_rating or 0)
         reviews = obj.reviews.filter(status='approved')
         avg = reviews.aggregate(avg=Avg('rating'))['avg']
         return float(avg or 0)
 
     def get_review_count(self, obj):
+        if hasattr(obj, 'annotated_review_count'):
+            return int(obj.annotated_review_count or 0)
         return obj.reviews.filter(status='approved').count()
 
     def _is_staff_request(self):
@@ -434,6 +444,87 @@ class ProductSerializer(serializers.ModelSerializer):
                 sync_availability(instance, save=True)
         return instance
 
+
+
+
+class ProductListSerializer(serializers.ModelSerializer):
+    """Lightweight public list serializer — no nested reviews (avoids N+1).
+
+    average_rating / review_count read queryset annotations when present.
+    Detail/admin continue to use ProductSerializer.
+    """
+    image = serializers.SerializerMethodField()
+    gallery = serializers.SerializerMethodField()
+    images = serializers.SerializerMethodField()
+    discounted_price = serializers.SerializerMethodField()
+    average_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
+    stock_remaining = serializers.SerializerMethodField()
+    is_low_stock = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = [
+            'id',
+            'name',
+            'slug',
+            'category',
+            'price',
+            'discount',
+            'discounted_price',
+            'short_description',
+            'description',
+            'main_image',
+            'image',
+            'gallery',
+            'images',
+            'badge',
+            'three_d_model',
+            'availability',
+            'available_quantity',
+            'stock_remaining',
+            'is_low_stock',
+            'status',
+            'featured',
+            'delivery_time',
+            'rating',
+            'average_rating',
+            'review_count',
+            'is_active',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_image(self, obj):
+        return obj.main_image or (obj.images[0] if obj.images else '')
+
+    def get_gallery(self, obj):
+        return obj.images or ([obj.main_image] if obj.main_image else [])
+
+    def get_images(self, obj):
+        return obj.images or ([obj.main_image] if obj.main_image else [])
+
+    def get_discounted_price(self, obj):
+        return float(obj.discounted_price.quantize(__import__('decimal').Decimal('0.01')))
+
+    def get_average_rating(self, obj):
+        if hasattr(obj, 'annotated_average_rating'):
+            return float(obj.annotated_average_rating or 0)
+        return float(obj.rating or 0)
+
+    def get_review_count(self, obj):
+        if hasattr(obj, 'annotated_review_count'):
+            return int(obj.annotated_review_count or 0)
+        return 0
+
+    def get_stock_remaining(self, obj):
+        return int(getattr(obj, 'available_quantity', 0) or 0)
+
+    def get_is_low_stock(self, obj):
+        available = int(getattr(obj, 'available_quantity', 0) or 0)
+        threshold = int(getattr(obj, 'low_stock_threshold', 5) or 5)
+        return 0 < available <= threshold
 
 class CouponSerializer(serializers.ModelSerializer):
     product_ids = serializers.PrimaryKeyRelatedField(

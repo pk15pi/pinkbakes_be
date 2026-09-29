@@ -2108,3 +2108,176 @@ class AdminOpsControlCenterTests(TestCase):
         self.assertEqual(unassign.status_code, 200)
         order.refresh_from_db()
         self.assertIsNone(order.delivery_employee_id)
+
+
+
+class CartEdgeCaseTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.product = Product.objects.create(
+            name="Cart Edge Cake",
+            category="Chocolate Cakes",
+            price=Decimal("500.00"),
+            is_active=True,
+            status="published",
+            available_quantity=5,
+            reserved_quantity=0,
+            sold_quantity=0,
+            low_stock_threshold=2,
+        )
+
+    def test_empty_cart_validate_rejected(self):
+        response = self.client.post("/api/cart/validate/", {"items": []}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(response.json().get("valid", True))
+
+    def test_zero_quantity_rejected(self):
+        response = self.client.post(
+            "/api/cart/validate/",
+            {"items": [{"id": self.product.id, "quantity": 0}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_payment_create_rejects_empty_cart(self):
+        user = User.objects.create_user(username="emptycart", email="emptycart@example.com", password="Pass12345!")
+        self.client.force_authenticate(user=user)
+        response = self.client.post(
+            "/api/payments/create/",
+            {
+                "items": [],
+                "customer_name": "Empty",
+                "customer_email": "emptycart@example.com",
+                "customer_mobile": "9876543210",
+                "shipping_address": "1 St",
+                "city": "Mumbai",
+                "state": "MH",
+                "postal_code": "400001",
+                "country": "India",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class CacheFreshnessRegressionTests(TestCase):
+    """Ensure catalog caches invalidate on product change; payments never use stale price/stock."""
+
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        self.client = APIClient()
+        self.product = Product.objects.create(
+            name="Cache Fresh Cake",
+            category="Chocolate Cakes",
+            price=Decimal("1000.00"),
+            discount=0,
+            is_active=True,
+            status="published",
+            available_quantity=20,
+            reserved_quantity=0,
+            sold_quantity=0,
+            low_stock_threshold=5,
+            main_image="https://example.com/cache-cake.jpg",
+        )
+        self.user = User.objects.create_user(
+            username="cachepayer", email="cachepayer@example.com", password="Pass12345!"
+        )
+
+    def test_product_list_cache_invalidates_on_price_change(self):
+        first = self.client.get("/api/products/")
+        self.assertEqual(first.status_code, 200)
+        rows = first.json()
+        if isinstance(rows, dict):
+            rows = rows.get("results", [])
+        match = next(r for r in rows if r["id"] == self.product.id)
+        self.assertEqual(Decimal(str(match["price"])), Decimal("1000.00"))
+
+        # Warm identical query again (should still be correct)
+        warm = self.client.get("/api/products/")
+        self.assertEqual(warm.status_code, 200)
+
+        self.product.price = Decimal("1500.00")
+        self.product.save(update_fields=["price", "updated_at"])
+
+        after = self.client.get("/api/products/")
+        self.assertEqual(after.status_code, 200)
+        rows2 = after.json()
+        if isinstance(rows2, dict):
+            rows2 = rows2.get("results", [])
+        match2 = next(r for r in rows2 if r["id"] == self.product.id)
+        self.assertEqual(Decimal(str(match2["price"])), Decimal("1500.00"))
+
+    def test_categories_cache_invalidates_on_new_published_product(self):
+        first = self.client.get("/api/categories/")
+        self.assertEqual(first.status_code, 200)
+        names_before = {c.get("name") or c.get("category") for c in first.json()}
+
+        Product.objects.create(
+            name="Wedding Cache Cake",
+            category="Wedding Cakes",
+            price=Decimal("2000.00"),
+            is_active=True,
+            status="published",
+            available_quantity=3,
+        )
+        after = self.client.get("/api/categories/")
+        self.assertEqual(after.status_code, 200)
+        names_after = {c.get("name") or c.get("category") for c in after.json()}
+        self.assertTrue(
+            any("Wedding" in (n or "") for n in names_after),
+            f"Expected Wedding Cakes in categories after invalidate; got {names_after}",
+        )
+
+    def test_payment_create_uses_live_price_after_change(self):
+        """Payment path must not serve stale cached catalog price."""
+        self.client.force_authenticate(user=self.user)
+        self.product.price = Decimal("1800.00")
+        self.product.save(update_fields=["price", "updated_at"])
+
+        # Warm product list cache with old-looking query (price already 1800 in DB)
+        self.client.get("/api/products/")
+
+        response = self.client.post(
+            "/api/payments/create/",
+            {
+                "items": [{"id": self.product.id, "quantity": 1}],
+                "customer_name": "Cache Payer",
+                "customer_email": "cachepayer@example.com",
+                "customer_mobile": "9876543210",
+                "shipping_address": "12 Market Road",
+                "city": "Mumbai",
+                "state": "Maharashtra",
+                "postal_code": "400001",
+                "country": "India",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertIn("order_id", data)
+        order = Order.objects.get(id=data["order_id"])
+        self.assertEqual(order.subtotal_amount, Decimal("1800.00"))
+
+    def test_payment_create_rejects_oversell_after_stock_drop(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.get("/api/products/")  # warm list cache
+        self.product.available_quantity = 1
+        self.product.save(update_fields=["available_quantity", "updated_at"])
+
+        response = self.client.post(
+            "/api/payments/create/",
+            {
+                "items": [{"id": self.product.id, "quantity": 5}],
+                "customer_name": "Cache Payer",
+                "customer_email": "cachepayer@example.com",
+                "customer_mobile": "9876543210",
+                "shipping_address": "12 Market Road",
+                "city": "Mumbai",
+                "state": "Maharashtra",
+                "postal_code": "400001",
+                "country": "India",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
 
@@ -79,32 +80,43 @@ class AdminReportingService:
 
     @staticmethod
     def product_stats():
-        total = Product.objects.filter(is_active=True).count()
+        from django.db.models import Count, Q
+        total_all = Product.objects.count()
+        # Collapsed availability + status tallies where practical.
+        avail_map = {
+            row['availability']: row['c']
+            for row in Product.objects.values('availability').annotate(c=Count('id'))
+        }
         active = Product.objects.filter(is_active=True, status='published').count()
-        inactive = Product.objects.filter(is_active=False).count() + Product.objects.filter(is_active=True, status='archived').count()
+        inactive = (
+            Product.objects.filter(is_active=False).count()
+            + Product.objects.filter(is_active=True, status='archived').count()
+        )
         discounted = Product.objects.filter(discount__gt=0).count()
         no_image = Product.objects.filter(Q(main_image='') | Q(main_image__isnull=True)).count()
         with_3d = Product.objects.exclude(three_d_model='').exclude(three_d_model__isnull=True).count()
-        in_stock = Product.objects.filter(availability='in_stock').count()
-        low_stock = Product.objects.filter(availability='low_stock').count()
-        out_of_stock = Product.objects.filter(availability='out_of_stock').count()
         return {
-            'total_products': Product.objects.count(),
+            'total_products': total_all,
             'active_products': active,
             'inactive_products': inactive,
             'products_with_discounts': discounted,
             'products_without_images': no_image,
             'products_with_3d_assets': with_3d,
-            'in_stock_products': in_stock,
-            'low_stock_products': low_stock,
-            'out_of_stock_products': out_of_stock,
+            'in_stock_products': avail_map.get('in_stock', 0),
+            'low_stock_products': avail_map.get('low_stock', 0),
+            'out_of_stock_products': avail_map.get('out_of_stock', 0),
         }
 
     @staticmethod
     def review_stats():
         total = Review.objects.count()
         avg_rating = Review.objects.filter(status='approved').aggregate(avg=Avg('rating'))['avg'] or 0
-        distribution = {str(i): Review.objects.filter(status='approved', rating=i).count() for i in range(1, 6)}
+        dist_rows = (
+            Review.objects.filter(status='approved')
+            .values('rating')
+            .annotate(c=Count('id'))
+        )
+        distribution = {str(row['rating']): row['c'] for row in dist_rows}
         pending = Review.objects.filter(status='pending').count()
         return {
             'total_reviews': total,
@@ -176,12 +188,20 @@ class AdminReportingService:
 
     @staticmethod
     def summary(from_date=None, to_date=None, preset='custom'):
-        return {
+        # Short TTL for admin report overview only (not payment verify / order mutation paths).
+        from .cache_utils import admin_dashboard_cache_key
+        key = 'admin:report:summary:' + admin_dashboard_cache_key(preset or 'custom', from_date, to_date)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        payload = {
             'user_stats': AdminReportingService.user_stats(from_date, to_date, preset),
             'product_stats': AdminReportingService.product_stats(),
             'review_stats': AdminReportingService.review_stats(),
             'sales_stats': AdminReportingService.sales_summary(from_date, to_date, preset),
         }
+        cache.set(key, payload, 20)
+        return payload
 
     @staticmethod
     def product_performance(from_date=None, to_date=None, preset='custom'):

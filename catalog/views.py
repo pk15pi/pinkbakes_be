@@ -4,13 +4,15 @@ import json
 from decimal import Decimal
 
 from django.conf import settings
+from django.core.cache import cache
 from django.http import RawPostDataException
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
-from django.db.models import Avg, F, Q, Sum
+from django.db.models import Avg, Count, F, Q, Sum
 from django.utils import timezone
 from rest_framework import generics, permissions, status
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -29,7 +31,7 @@ from .admin_ops import (
 )
 from .constants import CATALOG_CATEGORIES, CATEGORY_FALLBACK_IMAGES
 from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
-from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
+from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductListSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
 from notifications import events as notification_events
 from notifications.service import (
     notify as notify_event,
@@ -49,6 +51,8 @@ class IsAdminUser(permissions.BasePermission):
 class AdminLoginView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'admin_login'
 
     def post(self, request):
         username = (request.data.get('username') or request.data.get('email') or '').strip()
@@ -95,6 +99,7 @@ class AdminLoginView(APIView):
 class AdminLogoutView(APIView):
     def post(self, request):
         if request.user.is_authenticated:
+            Token.objects.filter(user=request.user).delete()
             logout(request)
         return Response({'message': 'Admin logged out successfully.'}, status=status.HTTP_200_OK)
 
@@ -650,6 +655,8 @@ def _apply_delivery_totals(subtotal, discount_amount, shipping):
 
 class PaymentCreateView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'payment'
 
     def post(self, request):
         items = request.data.get('items') or []
@@ -783,6 +790,8 @@ class PaymentCreateView(APIView):
 
 class PaymentVerifyView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'payment'
 
     def post(self, request):
         order_id = (request.data.get('razorpay_order_id') or '').strip()
@@ -904,6 +913,16 @@ class PaymentWebhookView(APIView):
             return Response({'detail': 'Payment record not found for webhook.'}, status=status.HTTP_404_NOT_FOUND)
 
         if event in ('payment.captured', 'payment.authorized'):
+            amount_paise = payment_data.get('amount')
+            if amount_paise is not None:
+                try:
+                    if int(amount_paise) != PaymentService.amount_paise(payment.amount):
+                        payment.status = 'failed'
+                        payment.failure_reason = 'Webhook amount mismatch.'
+                        payment.save(update_fields=['status', 'failure_reason', 'updated_at'])
+                        return Response({'detail': 'Payment amount verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
+                except (TypeError, ValueError):
+                    return Response({'detail': 'Payment amount verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
             PaymentService.mark_payment_paid(
                 payment,
                 gateway_payment_id=payment_id or payment.gateway_payment_id,
@@ -1018,6 +1037,11 @@ class CategoryListView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        from .cache_utils import CATEGORIES_KEY, CATEGORIES_TTL
+        cached = cache.get(CATEGORIES_KEY)
+        if cached is not None:
+            return Response(cached)
+
         published = Product.objects.filter(is_active=True, status='published')
         counts = {}
         images = {}
@@ -1071,15 +1095,27 @@ class CategoryListView(APIView):
                 'product_count': count,
                 'image': sample or CATEGORY_FALLBACK_IMAGES.get(name, CATEGORY_FALLBACK_IMAGES.get(canonical_lower.get(name.lower(), ''), '')),
             })
+        cache.set(CATEGORIES_KEY, payload, CATEGORIES_TTL)
         return Response(payload)
 
 
 class ProductListView(generics.ListAPIView):
-    serializer_class = ProductSerializer
+    """Public product catalog list.
+
+    Uses ProductListSerializer (no nested reviews) + review aggregates to avoid N+1.
+    Default response remains a JSON array (SPA + existing tests). Optional ?page=
+    returns {count,page,page_size,total_pages,results}. Hard cap 200 items.
+    Short-TTL cache for anonymous identical queries only (never auth/cart/pay).
+    """
+    serializer_class = ProductListSerializer
     permission_classes = [permissions.AllowAny]
+    pagination_class = None
 
     def get_queryset(self):
-        queryset = Product.objects.filter(is_active=True, status='published')
+        queryset = Product.objects.filter(is_active=True, status='published').annotate(
+            annotated_average_rating=Avg('reviews__rating', filter=Q(reviews__status='approved')),
+            annotated_review_count=Count('reviews', filter=Q(reviews__status='approved')),
+        )
         category = self.request.query_params.get('category')
         if category and category != 'All Cakes':
             queryset = queryset.filter(category__iexact=category)
@@ -1088,10 +1124,38 @@ class ProductListView(generics.ListAPIView):
             queryset = queryset.filter(Q(name__icontains=search) | Q(short_description__icontains=search))
         return queryset.order_by('-featured', '-created_at')
 
+    def list(self, request, *args, **kwargs):
+        from .cache_utils import PRODUCT_LIST_TTL, versioned_product_list_key
+
+        qs = self.filter_queryset(self.get_queryset())
+        query_items = sorted((k, v) for k, v in request.query_params.items())
+        cache_key = versioned_product_list_key(query_items)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
+        if 'page' in request.query_params:
+            rows, meta = paginate_queryset(qs, request, default_page_size=48, max_page_size=100)
+            payload = {**meta, 'results': self.get_serializer(rows, many=True).data}
+        else:
+            try:
+                limit = int(request.query_params.get('limit', 200) or 200)
+            except (TypeError, ValueError):
+                limit = 200
+            limit = max(1, min(limit, 200))
+            rows = list(qs[:limit])
+            payload = self.get_serializer(rows, many=True).data
+
+        cache.set(cache_key, payload, PRODUCT_LIST_TTL)
+        return Response(payload)
+
 
 class ProductSlugDetailView(generics.RetrieveAPIView):
     """Public product detail by slug (for SEO deep links)."""
-    queryset = Product.objects.filter(is_active=True, status='published')
+    queryset = Product.objects.filter(is_active=True, status='published').annotate(
+        annotated_average_rating=Avg('reviews__rating', filter=Q(reviews__status='approved')),
+        annotated_review_count=Count('reviews', filter=Q(reviews__status='approved')),
+    ).prefetch_related('reviews')
     serializer_class = ProductSerializer
     permission_classes = [permissions.AllowAny]
     lookup_field = 'slug'
@@ -1109,7 +1173,10 @@ class ProductSlugDetailView(generics.RetrieveAPIView):
 
 
 class ProductDetailView(generics.RetrieveAPIView):
-    queryset = Product.objects.filter(is_active=True)
+    queryset = Product.objects.filter(is_active=True).annotate(
+        annotated_average_rating=Avg('reviews__rating', filter=Q(reviews__status='approved')),
+        annotated_review_count=Count('reviews', filter=Q(reviews__status='approved')),
+    ).prefetch_related('reviews')
     serializer_class = ProductSerializer
     permission_classes = [permissions.AllowAny]
 
@@ -1442,20 +1509,37 @@ class ProductAssetUploadView(APIView):
         if not product:
             return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        if 'image' in request.data:
-            product.main_image = request.data.get('image')
-            product.images = list(product.images or [])
-            if product.main_image and product.main_image not in product.images:
-                product.images.insert(0, product.main_image)
-            product.save(update_fields=['main_image', 'images'])
+        def _safe_asset_url(value, field_name='asset'):
+            raw = (value or '').strip() if isinstance(value, str) else ''
+            if not raw:
+                return ''
+            if len(raw) > 500:
+                raise ValueError(f'{field_name} URL is too long.')
+            lowered = raw.lower()
+            if not (lowered.startswith('https://') or lowered.startswith('http://') or lowered.startswith('/media/')):
+                raise ValueError(f'{field_name} must be an http(s) URL or /media/ path.')
+            if '..' in raw or chr(92) in raw:
+                raise ValueError(f'{field_name} path is invalid.')
+            return raw
 
-        if 'three_d_model' in request.data or 'three_d_assets' in request.data:
-            if 'three_d_model' in request.data:
-                product.three_d_model = request.data.get('three_d_model', '')
-            if 'three_d_assets' in request.data:
-                assets = request.data.get('three_d_assets')
-                product.three_d_assets = assets if isinstance(assets, list) else [assets]
-            product.save(update_fields=['three_d_model', 'three_d_assets'])
+        try:
+            if 'image' in request.data:
+                product.main_image = _safe_asset_url(request.data.get('image'), 'image')
+                product.images = list(product.images or [])
+                if product.main_image and product.main_image not in product.images:
+                    product.images.insert(0, product.main_image)
+                product.save(update_fields=['main_image', 'images'])
+
+            if 'three_d_model' in request.data or 'three_d_assets' in request.data:
+                if 'three_d_model' in request.data:
+                    product.three_d_model = _safe_asset_url(request.data.get('three_d_model', ''), 'three_d_model')
+                if 'three_d_assets' in request.data:
+                    assets = request.data.get('three_d_assets')
+                    raw_list = assets if isinstance(assets, list) else [assets]
+                    product.three_d_assets = [_safe_asset_url(a, 'three_d_assets') for a in raw_list if a]
+                product.save(update_fields=['three_d_model', 'three_d_assets'])
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         AdminActivity.objects.create(
             admin_user=request.user,
@@ -1960,11 +2044,13 @@ class DeliveryLocationUpdateView(APIView):
         if not order:
             return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        # Only staff may post courier GPS; customers must not spoof delivery location.
+        if not request.user.is_staff:
+            return Response({'detail': 'You are not authorized to update this delivery location.'}, status=status.HTTP_403_FORBIDDEN)
+
         employee = order.delivery_employee
         if not employee:
             return Response({'detail': 'This order has no assigned delivery employee.'}, status=status.HTTP_400_BAD_REQUEST)
-        if not request.user.is_staff and request.user.id != order.user_id:
-            return Response({'detail': 'You are not authorized to update this delivery location.'}, status=status.HTTP_403_FORBIDDEN)
 
         latitude = request.data.get('latitude')
         longitude = request.data.get('longitude')

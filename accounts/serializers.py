@@ -1,4 +1,3 @@
-import random
 import re
 import secrets
 from datetime import timedelta
@@ -13,7 +12,7 @@ from .models import UserProfile
 
 
 def generate_otp():
-    return str(random.randint(100000, 999999))
+    return f"{secrets.randbelow(900000) + 100000}"
 
 
 class SignupSerializer(serializers.ModelSerializer):
@@ -65,13 +64,15 @@ class SignupSerializer(serializers.ModelSerializer):
             verification_token_created_at=timezone.now(),
             email_verification_token=verification_token,
             email_verification_expires_at=timezone.now() + timedelta(days=1),
-            otp_code=otp_value,
+            otp_code=None,
             otp_created_at=timezone.now(),
             otp_hash=make_password(otp_value),
             otp_expires_at=timezone.now() + timedelta(minutes=10),
             otp_attempts=0,
             otp_last_sent_at=timezone.now(),
         )
+        # Plaintext OTP is only used by the view for email/SMS delivery, not stored.
+        profile._plaintext_otp = otp_value
         return user, profile
 
 

@@ -8,8 +8,9 @@ import csv
 import io
 
 from django.conf import settings
+from django.core.cache import cache
 from django.contrib.auth.models import User
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, F, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -128,26 +129,39 @@ class AdminDashboardMetricsView(APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request):
+        from .cache_utils import ADMIN_DASHBOARD_TTL, admin_dashboard_cache_key
+
         preset = (request.query_params.get('preset') or 'today').strip() or 'today'
         from_date = (request.query_params.get('from_date') or '').strip() or None
         to_date = (request.query_params.get('to_date') or '').strip() or None
+        cache_key = admin_dashboard_cache_key(preset, from_date, to_date)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached, status=status.HTTP_200_OK)
+
         start, end = AdminReportingService.parse_date_range(from_date, to_date, preset)
 
         orders_in_range = Order.objects.filter(created_at__gte=start, created_at__lte=end)
         today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
+        # One grouped query for live status tallies instead of N count() calls.
+        status_rows = (
+            Order.objects.values('status')
+            .annotate(c=Count('id'))
+        )
+        status_map = {row['status']: row['c'] for row in status_rows}
         order_counts = {
             'today': Order.objects.filter(created_at__gte=today_start).count(),
             'in_range': orders_in_range.count(),
-            'pending': Order.objects.filter(status='PENDING').count(),
-            'order_confirmed': Order.objects.filter(status='ORDER_CONFIRMED').count(),
-            'preparing': Order.objects.filter(status='PREPARING').count(),
-            'packing': Order.objects.filter(status='PACKING').count(),
-            'ready_for_delivery': Order.objects.filter(status='READY_FOR_DELIVERY').count(),
-            'delivery_boy_assigned': Order.objects.filter(status='DELIVERY_BOY_ASSIGNED').count(),
-            'out_for_delivery': Order.objects.filter(status='OUT_FOR_DELIVERY').count(),
-            'delivered': Order.objects.filter(status='DELIVERED').count(),
-            'cancelled': Order.objects.filter(status='CANCELLED').count(),
+            'pending': status_map.get('PENDING', 0),
+            'order_confirmed': status_map.get('ORDER_CONFIRMED', 0),
+            'preparing': status_map.get('PREPARING', 0),
+            'packing': status_map.get('PACKING', 0),
+            'ready_for_delivery': status_map.get('READY_FOR_DELIVERY', 0),
+            'delivery_boy_assigned': status_map.get('DELIVERY_BOY_ASSIGNED', 0),
+            'out_for_delivery': status_map.get('OUT_FOR_DELIVERY', 0),
+            'delivered': status_map.get('DELIVERED', 0),
+            'cancelled': status_map.get('CANCELLED', 0),
         }
 
         payments_qs = Payment.objects.filter(created_at__gte=start, created_at__lte=end)
@@ -176,10 +190,12 @@ class AdminDashboardMetricsView(APIView):
         }
 
         out_of_stock = Product.objects.filter(Q(availability='out_of_stock') | Q(available_quantity=0)).count()
-        low_stock_count = 0
-        for prod in Product.objects.filter(available_quantity__gt=0).only('available_quantity', 'low_stock_threshold', 'availability'):
-            if prod.availability == 'low_stock' or prod.available_quantity <= (prod.low_stock_threshold or 0):
-                low_stock_count += 1
+        # Prefer availability flag; also catch threshold breaches without Python loop.
+        low_stock_count = Product.objects.filter(
+            available_quantity__gt=0
+        ).filter(
+            Q(availability='low_stock') | Q(available_quantity__lte=F('low_stock_threshold'))
+        ).count()
         products = {
             'active': Product.objects.filter(is_active=True, status='published').count(),
             'out_of_stock': out_of_stock,
@@ -191,10 +207,12 @@ class AdminDashboardMetricsView(APIView):
             'new_in_range': User.objects.filter(is_staff=False, date_joined__gte=start, date_joined__lte=end).count(),
         }
 
+        review_rows = Review.objects.values('status').annotate(c=Count('id'))
+        review_map = {row['status']: row['c'] for row in review_rows}
         reviews = {
-            'pending': Review.objects.filter(status='pending').count(),
-            'approved': Review.objects.filter(status='approved').count(),
-            'rejected': Review.objects.filter(status='rejected').count(),
+            'pending': review_map.get('pending', 0),
+            'approved': review_map.get('approved', 0),
+            'rejected': review_map.get('rejected', 0),
         }
 
         now = timezone.now()
@@ -232,7 +250,7 @@ class AdminDashboardMetricsView(APIView):
             ),
         }
 
-        return Response({
+        payload = {
             'preset': preset,
             'from': start.isoformat(),
             'to': end.isoformat(),
@@ -248,7 +266,10 @@ class AdminDashboardMetricsView(APIView):
             'pending_orders': order_counts['pending'] + order_counts['order_confirmed'],
             'low_stock': products['low_stock'],
             'active_coupons': coupons['active'],
-        }, status=status.HTTP_200_OK)
+        }
+        # Short TTL only — overview KPIs, not a substitute for live payment/order reads.
+        cache.set(cache_key, payload, ADMIN_DASHBOARD_TTL)
+        return Response(payload, status=status.HTTP_200_OK)
 
 class AdminOrderDetailView(APIView):
     """Full order detail for admin: customer, items, address, coupon, payment, refund, employee, history."""

@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 
+from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.utils.text import slugify
 
@@ -136,7 +137,7 @@ SEED_PRODUCTS = [
         'main_image': 'https://images.unsplash.com/photo-1578985545062-69928b1d9587?auto=format&fit=crop&w=1000&q=85',
         'images': [
             'https://images.unsplash.com/photo-1578985545062-69928b1d9587?auto=format&fit=crop&w=1400&q=90',
-            'https://images.unsplash.com/photo-1606313564200-e75d5e30476b?auto=format&fit=crop&w=1400&q=90',
+            'https://images.unsplash.com/photo-1606890737304-57a1ca8a5b62?auto=format&fit=crop&w=1400&q=90',
         ],
         'available_quantity': 50,
     },
@@ -165,9 +166,9 @@ SEED_PRODUCTS = [
         'featured': False,
         'short_description': '70% Belgian cocoa sponge with dark ganache drip.',
         'description': 'Made with premium Belgian cocoa, this intense dark chocolate cake is finished with a dramatic ganache drip and cocoa nibs.',
-        'main_image': 'https://images.unsplash.com/photo-1606313564200-e75d5e30476b?auto=format&fit=crop&w=1000&q=85',
+        'main_image': 'https://images.unsplash.com/photo-1606890737304-57a1ca8a5b62?auto=format&fit=crop&w=1000&q=85',
         'images': [
-            'https://images.unsplash.com/photo-1606313564200-e75d5e30476b?auto=format&fit=crop&w=1400&q=90',
+            'https://images.unsplash.com/photo-1606890737304-57a1ca8a5b62?auto=format&fit=crop&w=1400&q=90',
         ],
         'available_quantity': 30,
     },
@@ -414,3 +415,7 @@ class Command(BaseCommand):
             ).count()
             flag = 'OK' if count >= 1 else 'MISSING'
             self.stdout.write(f'  [{flag}] {cat}: {count}')
+
+        # Point every product at local /products/cakes/* for Collab CSS 3D (main image).
+        self.stdout.write('Wiring local cake images for 3D / catalog...')
+        call_command('wire_local_cake_images')

@@ -49,6 +49,51 @@ def build_verification_email_html(user_name, verification_url):
     """
 
 
+
+
+def build_otp_email_html(user_name, otp, purpose="verification"):
+    first_name = (user_name or "there").strip() or "there"
+    purpose_label = "sign-in" if purpose == "login" else "account verification"
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; background:#fff7fb; padding:24px; color:#3a2a34;">
+        <div style="max-width:600px; margin:0 auto; background:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #f2dfe8;">
+          <div style="background:linear-gradient(135deg,#ff5ca8,#ff8bb8); color:#fff; padding:24px 32px;">
+            <h2 style="margin:0; font-size:28px;">PinkBakes</h2>
+          </div>
+          <div style="padding:32px;">
+            <p style="font-size:16px; margin:0 0 12px;">Hi {first_name},</p>
+            <p style="font-size:15px; line-height:1.6; margin:0 0 20px;">
+              Your PinkBakes one-time code for {purpose_label} is:
+            </p>
+            <p style="font-size:28px; letter-spacing:6px; font-weight:bold; text-align:center; margin:16px 0;">{otp}</p>
+            <p style="font-size:12px; color:#7b6070; margin-top:20px;">
+              This code expires in 10 minutes. If you did not request it, you can ignore this email.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
+
+def build_verification_email_html_with_otp(user_name, verification_url, otp=None):
+    html = build_verification_email_html(user_name, verification_url)
+    if not otp:
+        return html
+    otp_block = f"""
+            <p style="font-size:15px; line-height:1.6; margin:20px 0 8px;">
+              Or enter this one-time code in the app:
+            </p>
+            <p style="font-size:24px; letter-spacing:4px; font-weight:bold; text-align:center; margin:8px 0 20px;">{otp}</p>
+    """
+    return html.replace(
+        '<p style="font-size:12px; color:#7b6070; margin-top:20px;">',
+        otp_block + '<p style="font-size:12px; color:#7b6070; margin-top:20px;">',
+        1,
+    )
+
+
 def build_password_reset_email_html(user_name, reset_url):
     first_name = (user_name or 'there').strip() or 'there'
     return f"""

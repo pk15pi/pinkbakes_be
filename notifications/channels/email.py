@@ -5,8 +5,10 @@ import logging
 from django.conf import settings
 
 from accounts.email_service import (
+    build_otp_email_html,
     build_password_reset_email_html,
     build_verification_email_html,
+    build_verification_email_html_with_otp,
     send_html_email,
     send_order_cancellation_email,
     send_order_confirmation_email,
@@ -66,18 +68,31 @@ class EmailChannelAdapter:
                 return {'ok': True, 'skipped': False, 'error': '', 'recipient': recipient}
             if event == E.EMAIL_VERIFICATION_REQUIRED:
                 url = context.get('verification_url') or ''
+                otp = context.get('otp') or ''
                 name = context.get('user_name') or (getattr(user, 'first_name', None) or getattr(user, 'username', '') if user else 'there')
-                html = body_html or build_verification_email_html(name, url)
+                html = body_html or build_verification_email_html_with_otp(name, url, otp)
                 subj = subject or 'Verify Your PinkBakes Account'
-                send_html_email(subj, [recipient], html, text_content=body_text or None)
+                text = body_text or (f'Verify: {url}' + (f' OTP: {otp}' if otp else ''))
+                send_html_email(subj, [recipient], html, text_content=text)
                 return {'ok': True, 'skipped': False, 'error': '', 'recipient': recipient}
             if event == E.MOBILE_VERIFICATION_REQUIRED:
-                # Existing flow emails verification link alongside OTP generation (OTP not emailed by default).
                 url = context.get('verification_url') or ''
+                otp = context.get('otp') or ''
                 name = context.get('user_name') or (getattr(user, 'first_name', None) or getattr(user, 'username', '') if user else 'there')
-                html = body_html or build_verification_email_html(name, url)
+                html = body_html or build_verification_email_html_with_otp(name, url, otp)
                 subj = subject or 'Verify Your PinkBakes Account'
-                send_html_email(subj, [recipient], html, text_content=body_text or None)
+                text = body_text or (f'Verify: {url}' + (f' OTP: {otp}' if otp else ''))
+                send_html_email(subj, [recipient], html, text_content=text)
+                return {'ok': True, 'skipped': False, 'error': '', 'recipient': recipient}
+            if event == E.LOGIN_OTP_REQUESTED:
+                otp = context.get('otp') or ''
+                if not otp:
+                    return {'ok': False, 'skipped': True, 'error': 'missing_otp'}
+                name = context.get('user_name') or (getattr(user, 'first_name', None) or getattr(user, 'username', '') if user else 'there')
+                html = body_html or build_otp_email_html(name, otp, purpose='login')
+                subj = subject or 'Your PinkBakes login code'
+                text = body_text or f'Your PinkBakes login OTP is {otp}. It expires in 10 minutes.'
+                send_html_email(subj, [recipient], html, text_content=text)
                 return {'ok': True, 'skipped': False, 'error': '', 'recipient': recipient}
             if event == E.PASSWORD_RESET_REQUESTED:
                 url = context.get('reset_url') or ''

@@ -50,7 +50,8 @@ def flatten_context(context: dict | None) -> dict:
     ctx = dict(context or {})
     flat = {}
     for key, value in ctx.items():
-        if key.lower() in SENSITIVE_KEYS:
+        # Allow otp through for channel delivery templates; logs use safe_context_snapshot.
+        if key.lower() in SENSITIVE_KEYS and key.lower() not in ("otp", "otp_code"):
             continue
         if hasattr(value, 'pk') and key == 'order':
             order = value

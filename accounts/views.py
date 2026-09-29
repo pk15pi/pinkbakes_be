@@ -1,7 +1,4 @@
-import random
-import secrets
-from datetime import timedelta
-
+import logging
 import secrets
 from datetime import timedelta
 
@@ -13,12 +10,35 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from notifications import events as notification_events
 from notifications.service import notify as notify_event
 from .models import PasswordResetToken, UserProfile
 from .serializers import SigninSerializer, SignupSerializer
+
+logger = logging.getLogger(__name__)
+
+
+def _secure_otp():
+    return f"{secrets.randbelow(900000) + 100000}"
+
+
+def _store_otp(profile, otp, *, now=None):
+    """Persist OTP hash only — never keep plaintext otp_code."""
+    now = now or timezone.now()
+    profile.otp_code = None
+    profile.otp_hash = make_password(otp)
+    profile.otp_created_at = now
+    profile.otp_expires_at = now + timedelta(minutes=10)
+    profile.otp_attempts = 0
+    profile.otp_last_sent_at = now
+
+
+def _maybe_log_dev_otp(purpose):
+    if getattr(settings, "DEBUG", False):
+        logger.info("DEV OTP generated for %s (delivered via email/SMS; not in API).", purpose)
 
 
 def _verification_link(token):
@@ -72,52 +92,62 @@ def _find_user_by_mobile(mobile):
 class SignupView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
 
     def post(self, request):
         serializer = SignupSerializer(data=request.data)
         if serializer.is_valid():
             user, profile = serializer.save()
-            token, _ = Token.objects.get_or_create(user=user)
             verification_url = _verification_link(profile.verification_token)
+            otp_plain = None
+            # OTP was hashed at create; regenerate plaintext only for email/SMS delivery.
+            otp_plain = _secure_otp()
+            _store_otp(profile, otp_plain)
+            profile.save(update_fields=[
+                "otp_code", "otp_hash", "otp_created_at", "otp_expires_at",
+                "otp_attempts", "otp_last_sent_at",
+            ])
             try:
                 notify_event(
                     notification_events.EMAIL_VERIFICATION_REQUIRED,
                     user=user,
                     email=user.email,
                     context={
-                        'user_name': user.first_name or user.username,
-                        'verification_url': verification_url,
-                        'message': 'Please verify your PinkBakes account.',
+                        "user_name": user.first_name or user.username,
+                        "verification_url": verification_url,
+                        "otp": otp_plain,
+                        "message": "Please verify your PinkBakes account.",
                     },
-                    idempotency_key=f'email_verify:{user.pk}:{profile.verification_token[:12]}',
-                    reference_type='user',
+                    idempotency_key=f"email_verify:{user.pk}:{profile.verification_token[:12]}",
+                    reference_type="user",
                     reference_id=str(user.pk),
                 )
                 notify_event(
                     notification_events.USER_REGISTERED,
                     user=user,
-                    context={'message': 'Welcome to PinkBakes!', 'title': 'Welcome'},
-                    channels=['in_app'],
-                    idempotency_key=f'user_registered:{user.pk}',
-                    reference_type='user',
+                    context={"message": "Welcome to PinkBakes!", "title": "Welcome"},
+                    channels=["in_app"],
+                    idempotency_key=f"user_registered:{user.pk}",
+                    reference_type="user",
                     reference_id=str(user.pk),
                 )
             except Exception:
                 pass
+            _maybe_log_dev_otp("signup")
             return Response(
                 {
-                    'message': 'Account created successfully. Please verify your email or mobile number before you can sign in.',
-                    'token': token.key,
-                    'verification_link': verification_url,
-                    'verification_token': profile.verification_token,
-                    'otp': profile.otp_code,
-                    'user': {
-                        'id': user.id,
-                        'username': user.username,
-                        'first_name': user.first_name,
-                        'last_name': user.last_name,
-                        'email': user.email,
-                        'mobile_number': profile.mobile_number,
+                    "message": (
+                        "Account created successfully. Please verify your email or mobile number "
+                        "before you can sign in. Check your inbox for the verification link and code."
+                    ),
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "first_name": user.first_name,
+                        "last_name": user.last_name,
+                        "email": user.email,
+                        "mobile_number": profile.mobile_number,
                     },
                 },
                 status=status.HTTP_201_CREATED,
@@ -125,26 +155,29 @@ class SignupView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+
 class SigninView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
 
     def post(self, request):
         serializer = SigninSerializer(data=request.data)
         if serializer.is_valid():
-            user = serializer.validated_data['user']
+            user = serializer.validated_data["user"]
             login(request, user)
             token, _ = Token.objects.get_or_create(user=user)
             return Response(
                 {
-                    'message': 'Signed in successfully.',
-                    'token': token.key,
-                    'user': {
-                        'id': user.id,
-                        'username': user.username,
-                        'first_name': user.first_name,
-                        'last_name': user.last_name,
-                        'email': user.email,
+                    "message": "Signed in successfully.",
+                    "token": token.key,
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "first_name": user.first_name,
+                        "last_name": user.last_name,
+                        "email": user.email,
                     },
                 },
                 status=status.HTTP_200_OK,
@@ -152,37 +185,45 @@ class SigninView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+
 class SendVerificationView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "otp"
 
     def post(self, request):
-        email = request.data.get('email')
-        method = request.data.get('method', 'email')
+        email = (request.data.get("email") or "").strip()
+        method = request.data.get("method", "email")
+        generic = {
+            "message": (
+                "If an account exists for this email, a new verification link and OTP have been sent."
+            ),
+            "method": method,
+            "masked_email": _mask_email(email) if email else "",
+        }
         if not email:
-            return Response({'detail': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        user = User.objects.filter(email=email).first()
+        user = User.objects.filter(email__iexact=email).first()
         if not user:
-            return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(generic, status=status.HTTP_200_OK)
 
         profile, _ = UserProfile.objects.get_or_create(user=user)
         now = timezone.now()
         if profile.otp_last_sent_at and now - profile.otp_last_sent_at < timedelta(minutes=1):
-            return Response({'detail': 'Please wait before requesting another verification code.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+            return Response(
+                {"detail": "Please wait before requesting another verification code."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
 
         profile.verification_token = secrets.token_urlsafe(32)
         profile.verification_token_created_at = now
         profile.email_verification_token = profile.verification_token
         profile.email_verification_expires_at = now + timedelta(days=1)
 
-        otp = str(random.randint(100000, 999999))
-        profile.otp_code = otp
-        profile.otp_hash = make_password(otp)
-        profile.otp_created_at = now
-        profile.otp_expires_at = now + timedelta(minutes=10)
-        profile.otp_attempts = 0
-        profile.otp_last_sent_at = now
+        otp = _secure_otp()
+        _store_otp(profile, otp, now=now)
         profile.save()
 
         verification_url = _verification_link(profile.verification_token)
@@ -192,45 +233,39 @@ class SendVerificationView(APIView):
                 user=user,
                 email=user.email,
                 context={
-                    'user_name': user.first_name or user.username,
-                    'verification_url': verification_url,
-                    'message': 'Please verify your PinkBakes account.',
+                    "user_name": user.first_name or user.username,
+                    "verification_url": verification_url,
+                    "otp": otp,
+                    "message": "Please verify your PinkBakes account.",
                 },
                 force=True,
-                reference_type='user',
+                reference_type="user",
                 reference_id=str(user.pk),
             )
-            if method == 'mobile':
+            if method == "mobile":
                 notify_event(
                     notification_events.MOBILE_VERIFICATION_REQUIRED,
                     user=user,
-                    phone=getattr(profile, 'mobile_number', '') or '',
+                    phone=getattr(profile, "mobile_number", "") or "",
+                    email=user.email,
                     context={
-                        'user_name': user.first_name or user.username,
-                        'verification_url': verification_url,
-                        'message': 'Mobile verification code generated.',
+                        "user_name": user.first_name or user.username,
+                        "verification_url": verification_url,
+                        "otp": otp,
+                        "message": "Mobile verification code generated.",
                     },
-                    channels=['sms', 'in_app'],
+                    channels=["sms", "email", "in_app"],
                     force=True,
-                    reference_type='user',
+                    reference_type="user",
                     reference_id=str(user.pk),
                 )
         except Exception:
             pass
 
-        return Response(
-            {
-                'message': 'A new verification link and OTP have been generated.',
-                'verification_link': _verification_link(profile.verification_token),
-                'verification_token': profile.verification_token,
-                'otp': profile.otp_code,
-                'method': method,
-                'email': email,
-                'masked_email': _mask_email(email),
-                'masked_mobile': _mask_mobile(profile.mobile_number),
-            },
-            status=status.HTTP_200_OK,
-        )
+        _maybe_log_dev_otp("send-verification")
+        generic["masked_mobile"] = _mask_mobile(profile.mobile_number)
+        return Response(generic, status=status.HTTP_200_OK)
+
 
 
 class VerifyEmailView(APIView):
@@ -276,6 +311,8 @@ class VerifyEmailView(APIView):
 class VerifyOtpView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "otp"
 
     def post(self, request):
         email = request.data.get('email')
@@ -320,88 +357,129 @@ class VerifyOtpView(APIView):
 class RequestLoginOtpView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "otp"
 
     def post(self, request):
-        mobile = (request.data.get('mobile') or '').strip()
+        mobile = (request.data.get("mobile") or "").strip()
+        generic = {
+            "message": "If this mobile number is registered, an OTP has been sent to it."
+        }
         if not mobile:
-            return Response({'detail': 'Mobile number is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "Mobile number is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         user = _find_user_by_mobile(mobile)
         if not user:
-            return Response({
-                'message': 'If this mobile number is registered, an OTP has been sent to it.'
-            }, status=status.HTTP_200_OK)
+            return Response(generic, status=status.HTTP_200_OK)
 
-        profile = getattr(user, 'profile', None)
+        profile = getattr(user, "profile", None)
         if not profile:
-            return Response({
-                'message': 'If this mobile number is registered, an OTP has been sent to it.'
-            }, status=status.HTTP_200_OK)
+            return Response(generic, status=status.HTTP_200_OK)
 
         if not user.is_active or not profile.is_verified:
-            return Response({'detail': 'Your account is not active yet. Please verify your email or mobile number first.'}, status=status.HTTP_400_BAD_REQUEST)
+            # Avoid confirming account state to strangers; same generic message.
+            return Response(generic, status=status.HTTP_200_OK)
 
-        otp = str(random.randint(100000, 999999))
-        profile.otp_code = otp
-        profile.otp_hash = make_password(otp)
-        profile.otp_created_at = timezone.now()
-        profile.otp_expires_at = timezone.now() + timedelta(minutes=10)
-        profile.otp_attempts = 0
-        profile.otp_last_sent_at = timezone.now()
-        profile.save(update_fields=['otp_code', 'otp_hash', 'otp_created_at', 'otp_expires_at', 'otp_attempts', 'otp_last_sent_at'])
+        now = timezone.now()
+        if profile.otp_last_sent_at and now - profile.otp_last_sent_at < timedelta(minutes=1):
+            return Response(
+                {"detail": "Please wait before requesting another OTP."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        otp = _secure_otp()
+        _store_otp(profile, otp, now=now)
+        profile.save(
+            update_fields=[
+                "otp_code",
+                "otp_hash",
+                "otp_created_at",
+                "otp_expires_at",
+                "otp_attempts",
+                "otp_last_sent_at",
+            ]
+        )
 
         try:
             notify_event(
                 notification_events.LOGIN_OTP_REQUESTED,
                 user=user,
                 phone=profile.mobile_number,
-                context={'message': 'Your PinkBakes login OTP is ready.', 'title': 'Login OTP'},
-                channels=['sms', 'in_app'],
+                email=user.email,
+                context={
+                    "message": "Your PinkBakes login code was sent to your email/SMS.",
+                    "title": "Login OTP",
+                    "otp": otp,
+                    "user_name": user.first_name or user.username,
+                },
+                channels=["sms", "email"],
                 force=True,
-                reference_type='user',
+                reference_type="user",
                 reference_id=str(user.pk),
             )
         except Exception:
             pass
 
-        return Response({
-            'message': f'OTP sent successfully. Use the code {otp} to sign in.',
-            'otp': otp,
-        }, status=status.HTTP_200_OK)
+        _maybe_log_dev_otp("login-otp")
+        return Response(generic, status=status.HTTP_200_OK)
+
 
 
 class VerifyLoginOtpView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "otp"
 
     def post(self, request):
-        mobile = (request.data.get('mobile') or '').strip()
-        otp = (request.data.get('otp') or '').strip()
+        mobile = (request.data.get("mobile") or "").strip()
+        otp = (request.data.get("otp") or "").strip()
 
         if not mobile or not otp:
-            return Response({'detail': 'Mobile number and OTP are required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Mobile number and OTP are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         user = _find_user_by_mobile(mobile)
+        invalid = Response(
+            {"detail": "Invalid mobile number or OTP."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
         if not user:
-            return Response({'detail': 'The mobile number is not registered.'}, status=status.HTTP_400_BAD_REQUEST)
+            return invalid
 
-        profile = getattr(user, 'profile', None)
+        profile = getattr(user, "profile", None)
         if not profile:
-            return Response({'detail': 'User profile not found.'}, status=status.HTTP_404_NOT_FOUND)
+            return invalid
 
         if user.is_active is False or profile.is_verified is False:
-            return Response({'detail': 'Your account has not been verified. Please verify your email or mobile number before signing in.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "detail": (
+                        "Your account has not been verified. Please verify your email or "
+                        "mobile number before signing in."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if profile.otp_expires_at and timezone.now() > profile.otp_expires_at:
-            return Response({'detail': 'This OTP has expired. Please request a new one.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "This OTP has expired. Please request a new one."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if profile.otp_attempts >= 5:
-            return Response({'detail': 'Too many OTP attempts. Please request a new code.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+            return Response(
+                {"detail": "Too many OTP attempts. Please request a new code."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
 
         if not profile.otp_hash or not check_password(str(otp).strip(), profile.otp_hash):
             profile.otp_attempts += 1
-            profile.save(update_fields=['otp_attempts'])
-            return Response({'detail': 'Invalid OTP.'}, status=status.HTTP_400_BAD_REQUEST)
+            profile.save(update_fields=["otp_attempts"])
+            return invalid
 
         login(request, user)
         token, _ = Token.objects.get_or_create(user=user)
@@ -410,25 +488,33 @@ class VerifyLoginOtpView(APIView):
         profile.otp_created_at = None
         profile.otp_expires_at = None
         profile.otp_attempts = 0
-        profile.save(update_fields=['otp_code', 'otp_hash', 'otp_created_at', 'otp_expires_at', 'otp_attempts'])
+        profile.save(
+            update_fields=["otp_code", "otp_hash", "otp_created_at", "otp_expires_at", "otp_attempts"]
+        )
 
-        return Response({
-            'message': 'OTP login successful.',
-            'token': token.key,
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'first_name': user.first_name,
-                'last_name': user.last_name,
-                'email': user.email,
-                'mobile_number': profile.mobile_number,
+        return Response(
+            {
+                "message": "OTP login successful.",
+                "token": token.key,
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "email": user.email,
+                    "mobile_number": profile.mobile_number,
+                },
             },
-        }, status=status.HTTP_200_OK)
+            status=status.HTTP_200_OK,
+        )
+
 
 
 class ForgotPasswordView(APIView):
     authentication_classes = []
     permission_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
 
     def post(self, request):
         email = (request.data.get('email') or '').strip().lower()
@@ -526,6 +612,7 @@ class ResetPasswordView(APIView):
         reset_token.save(update_fields=['used_at'])
 
         PasswordResetToken.objects.filter(user=user, used_at__isnull=True).update(used_at=timezone.now())
+        Token.objects.filter(user=user).delete()
 
         try:
             notify_event(
@@ -542,6 +629,17 @@ class ResetPasswordView(APIView):
             pass
 
         return Response({'message': 'Your password has been reset successfully.'}, status=status.HTTP_200_OK)
+
+
+
+
+class LogoutView(APIView):
+    """Invalidate the caller's DRF auth token."""
+
+    def post(self, request):
+        if request.user.is_authenticated:
+            Token.objects.filter(user=request.user).delete()
+        return Response({"message": "Signed out successfully."}, status=status.HTTP_200_OK)
 
 
 class MeView(APIView):

@@ -3,6 +3,7 @@ from django.urls import path
 from .address_views import AddressDetailView, AddressListCreateView, AddressSetDefaultView
 from .views import (
     ForgotPasswordView,
+    LogoutView,
     MeView,
     RequestLoginOtpView,
     ResetPasswordView,
@@ -26,6 +27,7 @@ urlpatterns = [
     path('forgot-password/', ForgotPasswordView.as_view(), name='forgot-password'),
     path('verify-reset-token/', VerifyResetTokenView.as_view(), name='verify-reset-token'),
     path('reset-password/', ResetPasswordView.as_view(), name='reset-password'),
+    path('logout/', LogoutView.as_view(), name='logout'),
     path('me/', MeView.as_view(), name='me'),
 ]
 

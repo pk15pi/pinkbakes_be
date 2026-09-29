@@ -114,3 +114,151 @@ class PasswordResetFlowTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         expired_token.refresh_from_db()
         self.assertIsNone(expired_token.used_at)
+
+
+
+class SigninAndMeTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="signinuser",
+            email="signinuser@example.com",
+            password="SecurePass123",
+            first_name="Sign",
+            last_name="In",
+            is_active=True,
+        )
+        from .models import UserProfile
+        UserProfile.objects.create(
+            user=self.user,
+            mobile_number="9876511111",
+            is_verified=True,
+            email_verified=True,
+            mobile_verified=True,
+        )
+
+    def test_signin_returns_token_for_verified_user(self):
+        response = self.client.post(
+            "/api/accounts/signin/",
+            {"username": "signinuser", "password": "SecurePass123"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertIn("token", data)
+        self.assertEqual(data["user"]["username"], "signinuser")
+
+    def test_signin_rejects_bad_password(self):
+        response = self.client.post(
+            "/api/accounts/signin/",
+            {"username": "signinuser", "password": "WrongPass999"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_signin_rejects_unverified_user(self):
+        unverified = User.objects.create_user(
+            username="unverified",
+            email="unverified@example.com",
+            password="SecurePass123",
+            is_active=False,
+        )
+        from .models import UserProfile
+        UserProfile.objects.create(
+            user=unverified,
+            mobile_number="9876522222",
+            is_verified=False,
+        )
+        response = self.client.post(
+            "/api/accounts/signin/",
+            {"username": "unverified", "password": "SecurePass123"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_me_requires_auth_and_returns_profile(self):
+        denied = self.client.get("/api/accounts/me/")
+        self.assertEqual(denied.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        from rest_framework.authtoken.models import Token
+        token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
+        ok = self.client.get("/api/accounts/me/")
+        self.assertEqual(ok.status_code, status.HTTP_200_OK)
+        data = ok.json()
+        self.assertEqual(data["username"], "signinuser")
+        self.assertTrue(data["is_verified"])
+        self.assertEqual(data["mobile_number"], "9876511111")
+
+
+class OtpLockoutAndThrottleTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="otplock",
+            email="otplock@example.com",
+            password="SecurePass123",
+            is_active=True,
+        )
+        from .models import UserProfile
+        self.profile = UserProfile.objects.create(
+            user=self.user,
+            mobile_number="9876533333",
+            is_verified=True,
+            email_verified=True,
+            mobile_verified=True,
+        )
+
+    def test_login_otp_lockout_after_five_failures(self):
+        self.profile.otp_hash = make_password("111111")
+        self.profile.otp_expires_at = timezone.now() + timedelta(minutes=5)
+        self.profile.otp_attempts = 0
+        self.profile.save(update_fields=["otp_hash", "otp_expires_at", "otp_attempts"])
+
+        for _ in range(5):
+            response = self.client.post(
+                "/api/accounts/verify-login-otp/",
+                {"mobile": "9876533333", "otp": "000000"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        locked = self.client.post(
+            "/api/accounts/verify-login-otp/",
+            {"mobile": "9876533333", "otp": "111111"},
+            format="json",
+        )
+        self.assertEqual(locked.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.profile.refresh_from_db()
+        self.assertGreaterEqual(self.profile.otp_attempts, 5)
+
+    def test_verify_otp_lockout_after_five_failures(self):
+        self.profile.otp_hash = make_password("222222")
+        self.profile.otp_expires_at = timezone.now() + timedelta(minutes=5)
+        self.profile.otp_attempts = 0
+        self.profile.save(update_fields=["otp_hash", "otp_expires_at", "otp_attempts"])
+
+        for _ in range(5):
+            response = self.client.post(
+                "/api/accounts/verify-otp/",
+                {"email": "otplock@example.com", "otp": "000000"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        locked = self.client.post(
+            "/api/accounts/verify-otp/",
+            {"email": "otplock@example.com", "otp": "222222"},
+            format="json",
+        )
+        self.assertEqual(locked.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_send_verification_throttles_within_one_minute(self):
+        self.profile.otp_last_sent_at = timezone.now()
+        self.profile.save(update_fields=["otp_last_sent_at"])
+        response = self.client.post(
+            "/api/accounts/send-verification/",
+            {"email": "otplock@example.com"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
