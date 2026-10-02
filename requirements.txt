@@ -1,5 +1,8 @@
-﻿Django~=5.2.16
+Django~=5.2.16
 djangorestframework~=3.17.1
 django-cors-headers~=4.9.0
 pillow~=12.2.0
 razorpay>=1.4.0,<2
+# PostgreSQL (prod / staging). Local default remains SQLite.
+psycopg[binary]>=3.1,<4
+dj-database-url>=2.1,<3

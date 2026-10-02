@@ -126,12 +126,45 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'pinkbakes_backend.wsgi.application'
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+# Database: SQLite locally. Staging/prod: set DATABASE_URL (Railway/Render)
+# or DB_ENGINE=postgresql with POSTGRES_* vars. Requires psycopg.
+_database_url = os.environ.get('DATABASE_URL', '').strip()
+_db_engine = os.environ.get('DB_ENGINE', '').strip().lower()
+_db_conn_max_age = int(os.environ.get('DB_CONN_MAX_AGE', '600'))
+
+if _database_url:
+    import dj_database_url
+
+    DATABASES = {
+        'default': dj_database_url.parse(
+            _database_url,
+            conn_max_age=_db_conn_max_age,
+            ssl_require=_env_bool('DB_SSL_REQUIRE', not DEBUG),
+        )
     }
-}
+elif _db_engine in ('postgresql', 'postgres', 'django.db.backends.postgresql'):
+    _pg_options = {}
+    if _env_bool('DB_SSL_REQUIRE', not DEBUG):
+        _pg_options['sslmode'] = 'require'
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get('POSTGRES_DB', 'pinkbakes'),
+            'USER': os.environ.get('POSTGRES_USER', 'pinkbakes'),
+            'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
+            'HOST': os.environ.get('POSTGRES_HOST', 'localhost'),
+            'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+            'CONN_MAX_AGE': _db_conn_max_age,
+            'OPTIONS': _pg_options,
+        }
+    }
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
