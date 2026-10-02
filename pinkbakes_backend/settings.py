@@ -29,9 +29,9 @@ def _env_list(name, default):
     return [part.strip() for part in str(raw).split(',') if part.strip()]
 
 
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://pinkbakes.com')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://www.pinkbakes.com')
 PUBLIC_SITE_URL = os.environ.get('PUBLIC_SITE_URL', FRONTEND_URL)
-PUBLIC_CONTACT_PHONE = os.environ.get('PUBLIC_CONTACT_PHONE', '6033430700')
+PUBLIC_CONTACT_PHONE = os.environ.get('PUBLIC_CONTACT_PHONE', '+916033430700')
 EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
 EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
 EMAIL_USE_TLS = _env_bool('EMAIL_USE_TLS', True)
@@ -178,7 +178,8 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 REST_FRAMEWORK = {
 
