@@ -43,7 +43,7 @@ SERVER_EMAIL = DEFAULT_FROM_EMAIL
 PAYMENT_GATEWAY = os.environ.get('PAYMENT_GATEWAY', 'razorpay')
 PAYMENT_ENABLED = _env_bool('PAYMENT_ENABLED', False)
 # Empty defaults outside DEBUG so production never silently uses placeholder secrets.
-_DEBUG_EARLY = _env_bool('DJANGO_DEBUG', True)
+_DEBUG_EARLY = _env_bool('DJANGO_DEBUG', False)
 RAZORPAY_KEY_ID = os.environ.get(
     'RAZORPAY_KEY_ID',
     'rzp_test_default_key' if _DEBUG_EARLY else '',
