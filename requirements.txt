@@ -7,3 +7,4 @@ razorpay>=1.4.0,<2
 # PostgreSQL (prod / staging). Local default remains SQLite.
 psycopg[binary]>=3.1,<4
 dj-database-url>=2.1,<3
+python-dotenv

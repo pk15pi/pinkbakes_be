@@ -9,11 +9,12 @@ DEBUG on for development; production must set DJANGO_DEBUG=false and secrets.
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 
 from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
+load_dotenv(BASE_DIR / ".env")
 
 def _env_bool(name, default=False):
     raw = os.environ.get(name)
