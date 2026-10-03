@@ -65,8 +65,7 @@ else:
     EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
 # SECURITY: DEBUG defaults True for local; production must set DJANGO_DEBUG=false.
-DEBUG = _DEBUG_EARLY
-
+DEBUG = _DEBUG_EARLY = False
 SECRET_KEY = (os.environ.get('DJANGO_SECRET_KEY') or '').strip()
 if not SECRET_KEY:
     if DEBUG:
