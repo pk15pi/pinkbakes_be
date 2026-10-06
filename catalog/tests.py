@@ -2396,4 +2396,27 @@ class AdminQaMajorsRegressionTests(TestCase):
         self.assertEqual(customers_resp.status_code, 200)
         customer_count = customers_resp.json()['count']
         self.assertEqual(users['total_users'], customer_count)
+
         self.assertEqual(users['total_users'], User.objects.filter(is_staff=False).count())
+
+    def test_admin_refunds_order_number_and_pending_group(self):
+        """Refund list must expose human order_number and honor pending_group filter."""
+        resp = self.client.get('/api/admin/refunds/', {'page': 1, 'page_size': 25})
+        self.assertEqual(resp.status_code, 200, msg=getattr(resp, 'data', resp.content))
+        data = resp.json()
+        self.assertIn('pending_statuses', data)
+        self.assertEqual(set(data['pending_statuses']), {'requested', 'pending', 'processing'})
+        row = next(r for r in data['results'] if r.get('id') == self.refund.id)
+        self.assertEqual(row.get('order_number'), 'QA-PAY-100')
+        self.assertEqual(row.get('order_id'), self.order_with_payment.id)
+        # Raw FK may still be present; order_number must win for admin UI.
+        self.assertTrue(row.get('order_number'))
+
+        pending = self.client.get('/api/admin/refunds/', {'status': 'pending_group', 'page': 1, 'page_size': 25})
+        self.assertEqual(pending.status_code, 200, msg=getattr(pending, 'data', pending.content))
+        pdata = pending.json()
+        self.assertGreaterEqual(pdata['count'], 1)
+        for r in pdata['results']:
+            self.assertIn(r['status'], ('requested', 'pending', 'processing'))
+        self.assertTrue(any(r.get('order_number') == 'QA-PAY-100' for r in pdata['results']))
+
