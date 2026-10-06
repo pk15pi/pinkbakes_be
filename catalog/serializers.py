@@ -44,11 +44,14 @@ class DeliveryLocationSerializer(serializers.ModelSerializer):
 
 
 class RefundSerializer(serializers.ModelSerializer):
+    order_number = serializers.SerializerMethodField()
+
     class Meta:
         model = Refund
         fields = [
             'id',
             'order',
+            'order_number',
             'payment',
             'user',
             'gateway',
@@ -65,6 +68,10 @@ class RefundSerializer(serializers.ModelSerializer):
             'processed_at',
         ]
         read_only_fields = fields
+
+    def get_order_number(self, obj):
+        order = getattr(obj, 'order', None)
+        return order.order_number if order else None
 
 class OrderItemSerializer(serializers.ModelSerializer):
     product_name = serializers.SerializerMethodField()

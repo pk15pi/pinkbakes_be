@@ -51,15 +51,17 @@ class AdminReportingService:
 
     @staticmethod
     def user_stats(from_date=None, to_date=None, preset='custom'):
+        """Customer-facing user tallies (excludes staff), aligned with /api/admin/customers/."""
         start, end = AdminReportingService.parse_date_range(from_date, to_date, preset)
-        total = User.objects.count()
-        verified = User.objects.filter(profile__is_verified=True).count()
+        customers = User.objects.filter(is_staff=False)
+        total = customers.count()
+        verified = customers.filter(profile__is_verified=True).count()
         unverified = total - verified
-        new_today = User.objects.filter(date_joined__date=timezone.now().date()).count()
-        new_week = User.objects.filter(date_joined__gte=timezone.now() - timedelta(days=7)).count()
-        new_month = User.objects.filter(date_joined__gte=timezone.now() - timedelta(days=30)).count()
+        new_today = customers.filter(date_joined__date=timezone.now().date()).count()
+        new_week = customers.filter(date_joined__gte=timezone.now() - timedelta(days=7)).count()
+        new_month = customers.filter(date_joined__gte=timezone.now() - timedelta(days=30)).count()
         if from_date or to_date or preset != 'custom':
-            new_range = User.objects.filter(date_joined__gte=start, date_joined__lte=end).count()
+            new_range = customers.filter(date_joined__gte=start, date_joined__lte=end).count()
             return {
                 'total_users': total,
                 'verified_users': verified,
@@ -136,30 +138,52 @@ class AdminReportingService:
         order_queryset = Order.objects.filter(created_at__gte=start, created_at__lte=end)
 
         total_orders = order_queryset.count()
-        # total_sales recomputed below to include paid/refund_pending/refunded/partially_refunded
-        total_sales = 0.0
         failed_payments = payments.filter(status='failed').count()
-        pending_payments = payments.filter(status='pending').count()
+        pending_payments = payments.filter(status__in=['created', 'pending', 'authorized']).count()
         refunded_payments = payments.filter(status__in=['refunded', 'partially_refunded']).count()
-        successful_payments = payments.filter(status__in=['paid', 'refund_pending', 'refunded', 'partially_refunded']).count()
-        # Successful capture total still based on originally paid amount (paid + refund states).
         paid_like = payments.filter(status__in=['paid', 'refund_pending', 'refunded', 'partially_refunded'])
-        total_sales = float((paid_like.aggregate(total=Sum('amount'))['total'] or 0))
+
+        # Revenue from paid/refunded orders (authoritative). Covers paid orders missing Payment rows.
+        paid_orders = order_queryset.filter(payment_status__in=['paid', 'refunded'])
+        total_sales = float((paid_orders.aggregate(total=Sum('total_amount'))['total'] or 0))
+        payment_capture_total = float((paid_like.aggregate(total=Sum('amount'))['total'] or 0))
+
+        # Successful payment count: Payment rows + paid orders that never got a Payment row.
+        paid_order_ids_with_payment = set(
+            paid_like.exclude(order_id__isnull=True).values_list('order_id', flat=True)
+        )
+        orphan_paid_orders = paid_orders.exclude(id__in=paid_order_ids_with_payment).count()
+        successful_payments = paid_like.count() + orphan_paid_orders
+
         refunds_qs = Refund.objects.filter(status='completed', created_at__gte=start, created_at__lte=end)
         refunds_total = float((refunds_qs.aggregate(total=Sum('amount'))['total'] or 0))
         net_sales = total_sales - refunds_total
+
+        today = timezone.now().date()
+        month_start = timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        today_sales = float((
+            Order.objects.filter(
+                payment_status__in=['paid', 'refunded'], created_at__date=today,
+            ).aggregate(total=Sum('total_amount'))['total'] or 0
+        ))
+        monthly_sales = float((
+            Order.objects.filter(
+                payment_status__in=['paid', 'refunded'], created_at__gte=month_start,
+            ).aggregate(total=Sum('total_amount'))['total'] or 0
+        ))
 
         sales = {
             'total_orders': total_orders,
             'orders_today': order_queryset.filter(created_at__date=timezone.now().date()).count(),
             'orders_this_week': order_queryset.filter(created_at__gte=timezone.now() - timedelta(days=7)).count(),
-            'orders_this_month': order_queryset.filter(created_at__gte=timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)).count(),
+            'orders_this_month': order_queryset.filter(created_at__gte=month_start).count(),
             'total_sales': total_sales,
             'gross_sales': total_sales,
-            'discounts': float((order_queryset.filter(payment_status__in=['paid', 'refunded']).aggregate(total=Sum('discount_amount'))['total'] or 0)),
-            'delivery_charges': float((order_queryset.filter(payment_status__in=['paid', 'refunded']).aggregate(total=Sum('delivery_fee'))['total'] or 0)),
-            'today_sales': float((paid_like.filter(created_at__date=timezone.now().date()).aggregate(total=Sum('amount'))['total'] or 0)),
-            'monthly_sales': float((paid_like.filter(created_at__gte=timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)).aggregate(total=Sum('amount'))['total'] or 0)),
+            'payment_capture_total': payment_capture_total,
+            'discounts': float((paid_orders.aggregate(total=Sum('discount_amount'))['total'] or 0)),
+            'delivery_charges': float((paid_orders.aggregate(total=Sum('delivery_fee'))['total'] or 0)),
+            'today_sales': today_sales,
+            'monthly_sales': monthly_sales,
             'average_order_value': float((order_queryset.aggregate(avg=Avg('total_amount'))['avg'] or 0)),
             'cancelled_orders': order_queryset.filter(status='CANCELLED').count(),
             'pending_orders': order_queryset.filter(status='PENDING').count(),
@@ -172,7 +196,12 @@ class AdminReportingService:
             'net_sales': net_sales,
             'transactions': payments.count(),
             'currency': 'INR',
-            'note': 'Payment and order data are now integrated into revenue reporting. net_sales = successful payments - completed refunds.',
+            'note': (
+                'gross/total_sales = sum of paid/refunded order totals in range '
+                '(includes paid orders missing Payment rows); '
+                'payment_capture_total = sum of paid-like Payment amounts; '
+                'net_sales = gross_sales - completed refunds.'
+            ),
             'coupons_used_count': CouponRedemption.objects.filter(
                 status='redeemed', created_at__gte=start, created_at__lte=end,
             ).count(),

@@ -1713,10 +1713,17 @@ class AdminOrderListView(APIView):
 
 
 class AdminPaymentListView(APIView):
-    """List payments for admins without exposing gateway secrets/signatures."""
+    """List payments for admins without exposing gateway secrets/signatures.
+
+    Also surfaces paid/refunded orders that have no Payment row so the admin
+    Payments page matches Orders (common when an order was marked paid without
+    a gateway Payment record).
+    """
     permission_classes = [IsAdminUser]
 
     def get(self, request):
+        from .admin_ops import paginate_queryset
+
         payments = Payment.objects.select_related('order', 'user').order_by('-created_at')
         status_filter = (request.query_params.get('status') or '').strip()
         search = (request.query_params.get('search') or '').strip()
@@ -1739,9 +1746,8 @@ class AdminPaymentListView(APIView):
         if date_to:
             payments = payments.filter(created_at__date__lte=date_to)
 
-        page_rows, meta = paginate_queryset(payments, request)
         results = []
-        for payment in page_rows:
+        for payment in payments:
             order = payment.order
             results.append({
                 'id': payment.id,
@@ -1759,11 +1765,76 @@ class AdminPaymentListView(APIView):
                 'failure_reason': payment.failure_reason,
                 'created_at': payment.created_at,
                 'paid_at': payment.paid_at,
+                'source': 'payment',
             })
 
+        # Paid/refunded orders with no Payment row (derived rows for admin visibility).
+        # Skip when an explicit non-paid status filter is applied.
+        include_derived = (not status_filter) or status_filter in (
+            'paid', 'refunded', 'partially_refunded', 'refund_pending',
+        )
+        if include_derived:
+            order_ids_with_payment = set(
+                Payment.objects.exclude(order_id__isnull=True).values_list('order_id', flat=True)
+            )
+            orphan_qs = Order.objects.filter(
+                payment_status__in=['paid', 'refunded'],
+            ).exclude(id__in=order_ids_with_payment).select_related('user').order_by('-created_at')
+            if search:
+                orphan_qs = orphan_qs.filter(
+                    Q(order_number__icontains=search)
+                    | Q(customer_name__icontains=search)
+                    | Q(customer_email__icontains=search)
+                    | Q(user__username__icontains=search)
+                    | Q(user__email__icontains=search)
+                )
+            if date_from:
+                orphan_qs = orphan_qs.filter(created_at__date__gte=date_from)
+            if date_to:
+                orphan_qs = orphan_qs.filter(created_at__date__lte=date_to)
+            if status_filter in ('paid', 'refunded'):
+                orphan_qs = orphan_qs.filter(payment_status=status_filter)
+            for order in orphan_qs:
+                results.append({
+                    'id': None,
+                    'order_id': order.id,
+                    'order_number': order.order_number,
+                    'customer_name': order.customer_name,
+                    'customer_email': order.customer_email,
+                    'amount': str(order.total_amount),
+                    'currency': 'INR',
+                    'status': order.payment_status,
+                    'gateway': '',
+                    'gateway_order_id': '',
+                    'gateway_payment_id': '',
+                    'payment_method': '',
+                    'failure_reason': 'No Payment row (order marked paid/refunded without gateway payment).',
+                    'created_at': order.created_at,
+                    'paid_at': order.created_at,
+                    'source': 'order_derived',
+                })
+
+        # Sort combined list by created_at desc, then paginate in Python.
+        results.sort(key=lambda row: row.get('created_at') or timezone.now(), reverse=True)
+        try:
+            page = max(1, int(request.query_params.get('page', 1)))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(request.query_params.get('page_size', 25))
+        except (TypeError, ValueError):
+            page_size = 25
+        page_size = max(1, min(page_size, 100))
+        total = len(results)
+        start = (page - 1) * page_size
+        page_rows = results[start:start + page_size]
+        total_pages = (total + page_size - 1) // page_size if page_size else 0
         return Response({
-            **meta,
-            'results': results,
+            'count': total,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages,
+            'results': page_rows,
         }, status=status.HTTP_200_OK)
 
 
@@ -2245,21 +2316,51 @@ class AdminOrderRefundView(APIView):
 
 
 class AdminRefundListView(APIView):
-    """Minimal admin refund list: GET /api/admin/refunds/"""
+    """Admin refund list: GET /api/admin/refunds/
+
+    Returns all refunds (including requested/pending/processing) so the page
+    matches dashboard payments.refunds_pending.
+    """
     permission_classes = [IsAdminUser]
 
     def get(self, request):
+        from .admin_ops import paginate_queryset
+
         refunds = Refund.objects.select_related('order', 'payment', 'user').order_by('-created_at')
         status_filter = (request.query_params.get('status') or '').strip()
-        if status_filter:
-            refunds = refunds.filter(status=status_filter)
+        # Support comma-separated statuses and a pending_group shortcut used by the admin UI.
+        if status_filter == 'pending_group':
+            refunds = refunds.filter(status__in=['requested', 'pending', 'processing'])
+        elif status_filter:
+            statuses = [s.strip() for s in status_filter.split(',') if s.strip()]
+            if len(statuses) == 1:
+                refunds = refunds.filter(status=statuses[0])
+            elif statuses:
+                refunds = refunds.filter(status__in=statuses)
         order_id = (request.query_params.get('order_id') or '').strip()
         if order_id:
             refunds = refunds.filter(order_id=order_id)
+        search = (request.query_params.get('search') or '').strip()
+        if search:
+            refunds = refunds.filter(
+                Q(gateway_refund_id__icontains=search)
+                | Q(order__order_number__icontains=search)
+                | Q(reason__icontains=search)
+                | Q(user__username__icontains=search)
+                | Q(user__email__icontains=search)
+            )
         rows, meta = paginate_queryset(refunds, request)
+        payload = []
+        for refund in rows:
+            order = refund.order
+            row = RefundSerializer(refund).data
+            row['order_id'] = order.id if order else None
+            row['order_number'] = order.order_number if order else row.get('order_number')
+            payload.append(row)
         return Response({
             **meta,
-            'results': RefundSerializer(rows, many=True).data,
+            'results': payload,
+            'pending_statuses': ['requested', 'pending', 'processing'],
         }, status=status.HTTP_200_OK)
 
 

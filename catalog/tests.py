@@ -4,6 +4,7 @@ import hmac
 from decimal import Decimal
 
 from django.contrib.auth.models import User
+from django.utils import timezone
 from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -2281,3 +2282,118 @@ class CacheFreshnessRegressionTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class AdminQaMajorsRegressionTests(TestCase):
+    """Regression for admin Payments / Refunds / Reports QA mismatches."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username='qa_admin', password='pass12345', is_staff=True, is_superuser=True,
+        )
+        self.customer_a = User.objects.create_user(username='cust_a', password='pass12345', email='a@ex.com')
+        self.customer_b = User.objects.create_user(username='cust_b', password='pass12345', email='b@ex.com')
+        self.customer_c = User.objects.create_user(username='cust_c', password='pass12345', email='c@ex.com')
+        # Extra staff should not inflate Reports "Customers"/total_users.
+        User.objects.create_user(username='qa_staff2', password='pass12345', is_staff=True)
+
+        self.order_with_payment = Order.objects.create(
+            user=self.customer_a,
+            order_number='QA-PAY-100',
+            customer_name='Cust A',
+            customer_email='a@ex.com',
+            customer_mobile='9000000001',
+            shipping_address='1 St',
+            city='Kolkata',
+            state='WB',
+            postal_code='700001',
+            country='India',
+            subtotal_amount=100,
+            total_amount=100,
+            status='ORDER_CONFIRMED',
+            payment_status='paid',
+        )
+        self.payment = Payment.objects.create(
+            order=self.order_with_payment,
+            user=self.customer_a,
+            gateway='razorpay',
+            gateway_order_id='order_qa_100',
+            gateway_payment_id='pay_qa_100',
+            amount=100,
+            currency='INR',
+            status='refund_pending',
+            paid_at=timezone.now(),
+        )
+        self.refund = Refund.objects.create(
+            order=self.order_with_payment,
+            payment=self.payment,
+            user=self.customer_a,
+            gateway='razorpay',
+            gateway_refund_id='rfnd_qa_100',
+            amount=100,
+            currency='INR',
+            status='processing',
+            initiated_by=self.customer_a,
+            initiated_by_type='customer',
+        )
+        # Paid order with NO Payment row (the Payments empty / revenue undercount case).
+        self.orphan_paid = Order.objects.create(
+            user=self.customer_b,
+            order_number='QA-ORPHAN-1130',
+            customer_name='Cust B',
+            customer_email='b@ex.com',
+            customer_mobile='9000000002',
+            shipping_address='2 St',
+            city='Mumbai',
+            state='MH',
+            postal_code='400001',
+            country='India',
+            subtotal_amount=1080,
+            delivery_fee=50,
+            total_amount=1130,
+            status='OUT_FOR_DELIVERY',
+            payment_status='paid',
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.admin)
+
+    def test_admin_payments_includes_orphan_paid_order(self):
+        resp = self.client.get('/api/admin/payments/', {'page': 1, 'page_size': 25})
+        self.assertEqual(resp.status_code, 200, msg=getattr(resp, 'data', resp.content))
+        data = resp.json()
+        self.assertGreaterEqual(data['count'], 2)
+        order_numbers = {row.get('order_number') for row in data['results']}
+        self.assertIn('QA-PAY-100', order_numbers)
+        self.assertIn('QA-ORPHAN-1130', order_numbers)
+        orphan = next(r for r in data['results'] if r.get('order_number') == 'QA-ORPHAN-1130')
+        self.assertEqual(orphan.get('source'), 'order_derived')
+        self.assertEqual(float(orphan['amount']), 1130.0)
+
+    def test_admin_refunds_lists_processing_and_dashboard_pending(self):
+        refunds = self.client.get('/api/admin/refunds/', {'page': 1, 'page_size': 25})
+        self.assertEqual(refunds.status_code, 200, msg=getattr(refunds, 'data', refunds.content))
+        rdata = refunds.json()
+        self.assertGreaterEqual(rdata['count'], 1)
+        statuses = {row['status'] for row in rdata['results']}
+        self.assertIn('processing', statuses)
+        self.assertTrue(any(row.get('order_number') == 'QA-PAY-100' for row in rdata['results']))
+
+        dash = self.client.get('/api/admin/dashboard/', {'preset': 'last_30_days'})
+        self.assertEqual(dash.status_code, 200, msg=getattr(dash, 'data', dash.content))
+        self.assertGreaterEqual(dash.json()['payments']['refunds_pending'], 1)
+
+    def test_reports_revenue_and_users_align_with_orders_and_customers(self):
+        resp = self.client.get('/api/admin/reports/summary/', {'preset': 'last_30_days'})
+        self.assertEqual(resp.status_code, 200, msg=getattr(resp, 'data', resp.content))
+        data = resp.json()
+        sales = data['sales_stats']
+        users = data['user_stats']
+        # 100 + 1130 paid order totals
+        self.assertEqual(float(sales['total_sales']), 1230.0)
+        self.assertGreaterEqual(sales['successful_payments'], 2)
+        # Customers page definition: non-staff only (3 customers created here; ignore other DB users via lower bound)
+        customers_resp = self.client.get('/api/admin/customers/', {'page': 1, 'page_size': 100})
+        self.assertEqual(customers_resp.status_code, 200)
+        customer_count = customers_resp.json()['count']
+        self.assertEqual(users['total_users'], customer_count)
+        self.assertEqual(users['total_users'], User.objects.filter(is_staff=False).count())

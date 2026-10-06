@@ -166,7 +166,6 @@ class AdminDashboardMetricsView(APIView):
 
         payments_qs = Payment.objects.filter(created_at__gte=start, created_at__lte=end)
         paid_like = payments_qs.filter(status__in=['paid', 'refund_pending', 'refunded', 'partially_refunded'])
-        gross_sales = float(paid_like.aggregate(total=Sum('amount'))['total'] or 0)
         refunds_pending = Refund.objects.filter(status__in=['requested', 'pending', 'processing']).count()
         refunds_completed_qs = Refund.objects.filter(status='completed', created_at__gte=start, created_at__lte=end)
         refunds_completed_amount = float(refunds_completed_qs.aggregate(total=Sum('amount'))['total'] or 0)
@@ -176,17 +175,25 @@ class AdminDashboardMetricsView(APIView):
             created_at__gte=start, created_at__lte=end,
             payment_status__in=['paid', 'refunded'],
         )
+        # Gross from paid/refunded order totals (covers paid orders missing Payment rows).
+        gross_sales = float(paid_orders.aggregate(total=Sum('total_amount'))['total'] or 0)
+        payment_capture_total = float(paid_like.aggregate(total=Sum('amount'))['total'] or 0)
         discounts = float(paid_orders.aggregate(total=Sum('discount_amount'))['total'] or 0)
         coupon_discounts = float(paid_orders.aggregate(total=Sum('coupon_discount_amount'))['total'] or 0)
         delivery_charges = float(paid_orders.aggregate(total=Sum('delivery_fee'))['total'] or 0)
         net_sales = gross_sales - refunds_completed_amount
 
+        paid_order_ids_with_payment = set(
+            paid_like.exclude(order_id__isnull=True).values_list('order_id', flat=True)
+        )
+        orphan_paid = paid_orders.exclude(id__in=paid_order_ids_with_payment).count()
         payment_counts = {
-            'successful': payments_qs.filter(status__in=['paid', 'refund_pending', 'refunded', 'partially_refunded']).count(),
+            'successful': paid_like.count() + orphan_paid,
             'pending': payments_qs.filter(status__in=['created', 'pending', 'authorized']).count(),
             'failed': payments_qs.filter(status='failed').count(),
             'refunds_pending': refunds_pending,
             'refunds_completed': refunds_completed_count,
+            'payment_capture_total': payment_capture_total,
         }
 
         out_of_stock = Product.objects.filter(Q(availability='out_of_stock') | Q(available_quantity=0)).count()
@@ -243,7 +250,8 @@ class AdminDashboardMetricsView(APIView):
             'net_sales': net_sales,
             'currency': 'INR',
             'definition': (
-                'gross_sales = sum of paid/refund* payment amounts in range; '
+                'gross_sales = sum of paid/refunded order totals in range '
+                '(includes paid orders missing Payment rows); '
                 'refunds = completed refund amounts in range; '
                 'net_sales = gross_sales - refunds; '
                 'discounts/coupon_discounts/delivery_charges from paid/refunded orders in range.'
