@@ -46,6 +46,47 @@ class AuthSecretLeakTests(TestCase):
         self.assertIsNotNone(profile.otp_hash)
         self.assertTrue(len(mail.outbox) >= 1)
 
+    def test_signup_missing_email_returns_400(self):
+        """Missing/blank email must be HTTP 400 validation, never 500."""
+        base = {
+            "first_name": "Sec",
+            "last_name": "User",
+            "username": "secnouser",
+            "mobile_number": "9876500099",
+            "password": "SecurePass123",
+        }
+        # Completely omitted email
+        response = self.client.post("/api/accounts/signup/", base, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.json())
+
+        # Explicit null
+        response = self.client.post(
+            "/api/accounts/signup/",
+            {**base, "username": "secnouser2", "email": None},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.json())
+
+        # Empty string
+        response = self.client.post(
+            "/api/accounts/signup/",
+            {**base, "username": "secnouser3", "email": ""},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.json())
+
+        # Whitespace-only
+        response = self.client.post(
+            "/api/accounts/signup/",
+            {**base, "username": "secnouser4", "email": "   "},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.json())
+
     def test_request_login_otp_does_not_echo_code(self):
         user = User.objects.create_user(
             username="otpleak",

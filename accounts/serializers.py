@@ -17,6 +17,9 @@ def generate_otp():
 
 class SignupSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
+    # User.email has blank=True on the model, so ModelSerializer would treat it as
+    # optional and create() would KeyError on missing email -> HTTP 500. Force required.
+    email = serializers.EmailField(required=True)
     mobile_number = serializers.CharField(required=True)
 
     class Meta:
@@ -24,8 +27,10 @@ class SignupSerializer(serializers.ModelSerializer):
         fields = ('first_name', 'last_name', 'username', 'email', 'mobile_number', 'password')
 
     def validate_email(self, value):
-        value = value.strip()
-        if User.objects.filter(email=value).exists():
+        value = (value or '').strip()
+        if not value:
+            raise serializers.ValidationError('Email is required.')
+        if User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError('An account with this email already exists.')
         return value
 
@@ -40,7 +45,9 @@ class SignupSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         password = validated_data.pop('password')
         mobile_number = validated_data.pop('mobile_number')
-        email = validated_data['email'].strip()
+        email = (validated_data.get('email') or '').strip()
+        if not email:
+            raise serializers.ValidationError({'email': ['Email is required.']})
         username = validated_data['username'].strip()
 
         user = User.objects.create_user(
