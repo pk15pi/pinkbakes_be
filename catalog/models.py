@@ -135,6 +135,20 @@ class ProductView(models.Model):
         return f'View for {self.product.name}'
 
 
+class EmployeeCategory(models.Model):
+    name = models.CharField(max_length=80, unique=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        verbose_name_plural = 'employee categories'
+
+    def __str__(self):
+        return self.name
+
+
 class Employee(models.Model):
     STATUS_CHOICES = [
         ('ACTIVE', 'Active'),
@@ -145,11 +159,26 @@ class Employee(models.Model):
     ]
 
     user = models.OneToOneField(User, related_name='employee_profile', on_delete=models.SET_NULL, null=True, blank=True)
+    category = models.ForeignKey(EmployeeCategory, related_name='employees', on_delete=models.PROTECT)
     employee_id = models.CharField(max_length=30, unique=True)
     name = models.CharField(max_length=120)
+    designation = models.CharField(max_length=120, blank=True, default='')
     contact_number = models.CharField(max_length=20)
     email = models.EmailField(blank=True, default='')
     photo = models.URLField(blank=True, default='')
+    date_of_joining = models.DateField(null=True, blank=True)
+    address = models.TextField(blank=True, default='')
+    emergency_contact = models.CharField(max_length=20, blank=True, default='')
+    employment_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('ACTIVE', 'Active'),
+            ('INACTIVE', 'Inactive'),
+            ('ON_LEAVE', 'On Leave'),
+            ('TERMINATED', 'Terminated'),
+        ],
+        default='ACTIVE',
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -427,7 +456,11 @@ class AdminActivity(models.Model):
         ('coupon_update', 'Coupon Updated'),
         ('employee_assign', 'Delivery Employee Assigned'),
         ('employee_unassign', 'Delivery Employee Unassigned'),
+        ('employee_create', 'Employee Created'),
         ('employee_update', 'Employee Updated'),
+        ('employee_deactivate', 'Employee Deactivated'),
+        ('employee_category_create', 'Employee Category Created'),
+        ('employee_category_update', 'Employee Category Updated'),
         ('customer_status', 'Customer Account Status'),
         ('export', 'Data Export'),
     ]
@@ -631,4 +664,3 @@ class DeliverySettings(models.Model):
     def get_solo(cls):
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
-

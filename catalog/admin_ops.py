@@ -32,7 +32,7 @@ from .models import (
     Review,
 )
 from .serializers import (
-    EmployeeSerializer,
+    DeliveryEmployeeSerializer,
     OrderSerializer,
     ReviewSerializer,
 )
@@ -474,7 +474,7 @@ class AdminActiveDeliveriesView(APIView):
                 'customer_name': order.customer_name,
                 'customer_mobile': order.customer_mobile,
                 'postal_code': order.postal_code,
-                'delivery_employee': EmployeeSerializer(order.delivery_employee).data if order.delivery_employee else None,
+                'delivery_employee': DeliveryEmployeeSerializer(order.delivery_employee).data if order.delivery_employee else None,
                 'delivery_assigned_at': order.delivery_assigned_at,
                 'delivery_started_at': order.delivery_started_at,
                 'duration_minutes': duration_minutes,

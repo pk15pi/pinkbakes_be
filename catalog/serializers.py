@@ -2,10 +2,89 @@ from django.db.models import Avg, Count
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from .models import Coupon, CouponRedemption, DeliveryLocation, Employee, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review, DeliveryZone, DeliverySettings
+from .models import Coupon, CouponRedemption, DeliveryLocation, Employee, EmployeeCategory, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review, DeliveryZone, DeliverySettings
+
+
+class EmployeeCategorySerializer(serializers.ModelSerializer):
+    employee_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = EmployeeCategory
+        fields = ['id', 'name', 'is_active', 'employee_count', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'employee_count', 'created_at', 'updated_at']
+
+    def validate_name(self, value):
+        value = value.strip()
+        existing = EmployeeCategory.objects.filter(name__iexact=value)
+        if self.instance:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError('A category with this name already exists.')
+        return value
 
 
 class EmployeeSerializer(serializers.ModelSerializer):
+    category = serializers.PrimaryKeyRelatedField(queryset=EmployeeCategory.objects.all(), required=False)
+    category_name = serializers.CharField(source='category.name', read_only=True)
+
+    class Meta:
+        model = Employee
+        fields = [
+            'id',
+            'employee_id',
+            'name',
+            'category',
+            'category_name',
+            'designation',
+            'contact_number',
+            'email',
+            'photo',
+            'status',
+            'employment_status',
+            'date_of_joining',
+            'address',
+            'emergency_contact',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_category(self, value):
+        current_category_id = getattr(self.instance, 'category_id', None)
+        if not value.is_active and value.pk != current_category_id:
+            raise serializers.ValidationError('Choose an active employee category.')
+        return value
+
+    def validate(self, attrs):
+        if self.instance is None and 'category' not in attrs:
+            default_category = EmployeeCategory.objects.filter(name__iexact='Delivery Staff', is_active=True).first()
+            if not default_category:
+                raise serializers.ValidationError({'category': 'An active employee category is required.'})
+            attrs['category'] = default_category
+        return attrs
+
+    def update(self, instance, validated_data):
+        employment_status = validated_data.get('employment_status')
+        if employment_status in ('INACTIVE', 'ON_LEAVE', 'TERMINATED'):
+            validated_data['status'] = 'INACTIVE'
+        return super().update(instance, validated_data)
+
+    def validate_contact_number(self, value):
+        value = value.strip()
+        digits = ''.join(character for character in value if character.isdigit())
+        if len(digits) < 8 or len(digits) > 15 or any(character not in '+()- .0123456789' for character in value):
+            raise serializers.ValidationError('Enter a valid contact number containing 8 to 15 digits.')
+        return value
+
+    def validate_emergency_contact(self, value):
+        value = value.strip()
+        digits = ''.join(character for character in value if character.isdigit())
+        if value and (len(digits) < 8 or len(digits) > 15 or any(character not in '+()- .0123456789' for character in value)):
+            raise serializers.ValidationError('Enter a valid emergency contact containing 8 to 15 digits.')
+        return value
+
+
+class DeliveryEmployeeSerializer(serializers.ModelSerializer):
     class Meta:
         model = Employee
         fields = [
@@ -19,13 +98,6 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
-
-    def validate_contact_number(self, value):
-        value = value.strip()
-        if len(value) < 8:
-            raise serializers.ValidationError('Contact number must be at least 8 digits.')
-        return value
 
 
 class OrderStatusHistorySerializer(serializers.ModelSerializer):
@@ -95,7 +167,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
-    delivery_employee = EmployeeSerializer(read_only=True)
+    delivery_employee = DeliveryEmployeeSerializer(read_only=True)
     status_history = OrderStatusHistorySerializer(many=True, read_only=True)
     cancellable = serializers.SerializerMethodField()
     refunds = serializers.SerializerMethodField()
@@ -699,4 +771,3 @@ class DeliverySettingsSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['updated_at']
-

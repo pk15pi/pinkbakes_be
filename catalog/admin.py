@@ -1,6 +1,20 @@
 from django.contrib import admin
 
-from .models import DeliverySettings, DeliveryZone, InventoryTransaction, Order, Payment, Product, Refund
+from .models import DeliverySettings, DeliveryZone, Employee, EmployeeCategory, InventoryTransaction, Order, Payment, Product, Refund
+
+
+@admin.register(EmployeeCategory)
+class EmployeeCategoryAdmin(admin.ModelAdmin):
+    list_display = ('name', 'is_active', 'updated_at')
+    list_filter = ('is_active',)
+    search_fields = ('name',)
+
+
+@admin.register(Employee)
+class EmployeeAdmin(admin.ModelAdmin):
+    list_display = ('employee_id', 'name', 'category', 'employment_status', 'status', 'contact_number')
+    list_filter = ('category', 'employment_status', 'status')
+    search_fields = ('employee_id', 'name', 'contact_number', 'email')
 
 
 @admin.register(Refund)

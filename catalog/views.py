@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+from datetime import date
 from decimal import Decimal
 
 from django.conf import settings
@@ -30,8 +31,8 @@ from .admin_ops import (
     validate_order_status_transition,
 )
 from .constants import CATALOG_CATEGORIES, CATEGORY_FALLBACK_IMAGES
-from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
-from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductListSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
+from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, EmployeeCategory, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
+from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeCategorySerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductListSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
 from notifications import events as notification_events
 from notifications.service import (
     notify as notify_event,
@@ -1848,13 +1849,49 @@ class EmployeeManagementView(APIView):
                 return Response({'detail': 'Employee not found.'}, status=status.HTTP_404_NOT_FOUND)
             return Response(EmployeeSerializer(employee).data, status=status.HTTP_200_OK)
 
-        employees = Employee.objects.all().order_by('name')
-        search = request.query_params.get('search', '').strip()
-        status_filter = request.query_params.get('status')
+        employees = Employee.objects.select_related('category').all()
+        search = (request.query_params.get('search') or '').strip()
+        status_filter = (request.query_params.get('status') or '').strip()
+        employment_status = (request.query_params.get('employment_status') or '').strip()
+        category_filter = (request.query_params.get('category') or '').strip()
         if search:
-            employees = employees.filter(name__icontains=search) | employees.filter(employee_id__icontains=search)
+            employees = employees.filter(
+                Q(name__icontains=search)
+                | Q(employee_id__icontains=search)
+                | Q(contact_number__icontains=search)
+                | Q(email__icontains=search)
+            )
         if status_filter:
             employees = employees.filter(status=status_filter)
+        if employment_status:
+            employees = employees.filter(employment_status=employment_status)
+        if category_filter:
+            if category_filter.isdigit():
+                employees = employees.filter(category_id=int(category_filter))
+            else:
+                employees = employees.filter(category__name__iexact=category_filter)
+
+        for param, lookup in (('date_from', 'date_of_joining__gte'), ('date_to', 'date_of_joining__lte')):
+            raw_date = (request.query_params.get(param) or '').strip()
+            if raw_date:
+                try:
+                    parsed_date = date.fromisoformat(raw_date)
+                except ValueError:
+                    return Response({param: 'Use a valid date in YYYY-MM-DD format.'}, status=status.HTTP_400_BAD_REQUEST)
+                employees = employees.filter(**{lookup: parsed_date})
+
+        sort_key = (request.query_params.get('sort') or 'name').strip()
+        descending = sort_key.startswith('-')
+        sort_field = sort_key[1:] if descending else sort_key
+        allowed_sort_fields = {'name', 'employee_id', 'date_of_joining', 'employment_status', 'created_at'}
+        if sort_field not in allowed_sort_fields:
+            return Response({'sort': 'Unsupported sort field.'}, status=status.HTTP_400_BAD_REQUEST)
+        sort_expression = f'-{sort_field}' if descending else sort_field
+        employees = employees.order_by(sort_expression, 'id')
+
+        if 'page' in request.query_params or 'page_size' in request.query_params:
+            page_rows, page_data = paginate_queryset(employees, request)
+            return Response({**page_data, 'results': EmployeeSerializer(page_rows, many=True).data}, status=status.HTTP_200_OK)
         return Response(EmployeeSerializer(employees, many=True).data, status=status.HTTP_200_OK)
 
     def post(self, request):
@@ -1863,38 +1900,133 @@ class EmployeeManagementView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         employee = serializer.save()
+        log_admin_activity(
+            request.user, 'employee_create', entity_type='employee', entity_id=employee.id,
+            description=f'Created employee {employee.employee_id}', request=request,
+        )
         return Response(EmployeeSerializer(employee).data, status=status.HTTP_201_CREATED)
 
     def put(self, request, employee_id):
         employee = Employee.objects.filter(id=employee_id).first()
         if not employee:
             return Response({'detail': 'Employee not found.'}, status=status.HTTP_404_NOT_FOUND)
+        previous_category = employee.category.name
+        previous_employment_status = employee.employment_status
         serializer = EmployeeSerializer(employee, data=request.data, partial=False)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save()
+        employee = serializer.save()
+        changes = []
+        if previous_category != employee.category.name:
+            changes.append(f'category changed from {previous_category} to {employee.category.name}')
+        if previous_employment_status != employee.employment_status:
+            changes.append(f'employment status changed from {previous_employment_status} to {employee.employment_status}')
+        log_admin_activity(
+            request.user, 'employee_update', entity_type='employee', entity_id=employee.id,
+            description=f'Updated employee {employee.employee_id}' + (f'; {", ".join(changes)}' if changes else ''),
+            request=request,
+        )
         return Response(EmployeeSerializer(employee).data, status=status.HTTP_200_OK)
 
     def patch(self, request, employee_id):
         employee = Employee.objects.filter(id=employee_id).first()
         if not employee:
             return Response({'detail': 'Employee not found.'}, status=status.HTTP_404_NOT_FOUND)
+        previous_category = employee.category.name
+        previous_employment_status = employee.employment_status
         serializer = EmployeeSerializer(employee, data=request.data, partial=True)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save()
+        employee = serializer.save()
+        changes = []
+        if previous_category != employee.category.name:
+            changes.append(f'category changed from {previous_category} to {employee.category.name}')
+        if previous_employment_status != employee.employment_status:
+            changes.append(f'employment status changed from {previous_employment_status} to {employee.employment_status}')
+        action = 'employee_deactivate' if employee.employment_status in ('INACTIVE', 'TERMINATED') and previous_employment_status != employee.employment_status else 'employee_update'
+        log_admin_activity(
+            request.user, action, entity_type='employee', entity_id=employee.id,
+            description=f'Updated employee {employee.employee_id}' + (f'; {", ".join(changes)}' if changes else ''),
+            request=request,
+        )
         return Response(EmployeeSerializer(employee).data, status=status.HTTP_200_OK)
 
     def delete(self, request, employee_id):
         employee = Employee.objects.filter(id=employee_id).first()
         if not employee:
             return Response({'detail': 'Employee not found.'}, status=status.HTTP_404_NOT_FOUND)
-        if employee.orders_assigned.exists():
-            employee.status = 'INACTIVE'
-            employee.save(update_fields=['status'])
-            return Response({'message': 'Employee deactivated instead of being deleted because they are linked to historical orders.'}, status=status.HTTP_200_OK)
-        employee.delete()
-        return Response({'message': 'Employee deleted successfully.'}, status=status.HTTP_200_OK)
+        employee.employment_status = 'INACTIVE'
+        employee.status = 'INACTIVE'
+        employee.save(update_fields=['employment_status', 'status', 'updated_at'])
+        log_admin_activity(
+            request.user, 'employee_deactivate', entity_type='employee', entity_id=employee.id,
+            description=f'Deactivated employee {employee.employee_id}', request=request,
+        )
+        return Response({'message': 'Employee deactivated successfully.'}, status=status.HTTP_200_OK)
+
+
+class EmployeeCategoryManagementView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, category_id=None):
+        if category_id is not None:
+            category = EmployeeCategory.objects.annotate(employee_count=Count('employees')).filter(pk=category_id).first()
+            if not category:
+                return Response({'detail': 'Employee category not found.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(EmployeeCategorySerializer(category).data, status=status.HTTP_200_OK)
+
+        categories = EmployeeCategory.objects.annotate(employee_count=Count('employees')).order_by('name')
+        active_filter = request.query_params.get('is_active')
+        if active_filter in ('true', 'false'):
+            categories = categories.filter(is_active=(active_filter == 'true'))
+        return Response(EmployeeCategorySerializer(categories, many=True).data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = EmployeeCategorySerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        category = serializer.save()
+        log_admin_activity(
+            request.user, 'employee_category_create', entity_type='employee_category', entity_id=category.id,
+            description=f'Created employee category {category.name}', request=request,
+        )
+        category = EmployeeCategory.objects.annotate(employee_count=Count('employees')).get(pk=category.pk)
+        return Response(EmployeeCategorySerializer(category).data, status=status.HTTP_201_CREATED)
+
+    def patch(self, request, category_id):
+        category = EmployeeCategory.objects.filter(pk=category_id).first()
+        if not category:
+            return Response({'detail': 'Employee category not found.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = EmployeeCategorySerializer(category, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        log_admin_activity(
+            request.user, 'employee_category_update', entity_type='employee_category', entity_id=category.id,
+            description=f'Updated employee category {category.name}', request=request,
+        )
+        category = EmployeeCategory.objects.annotate(employee_count=Count('employees')).get(pk=category.pk)
+        return Response(EmployeeCategorySerializer(category).data, status=status.HTTP_200_OK)
+
+
+class EmployeeStatisticsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        status_counts = {
+            row['employment_status']: row['total']
+            for row in Employee.objects.values('employment_status').annotate(total=Count('id'))
+        }
+        total = sum(status_counts.values())
+        categories = EmployeeCategory.objects.annotate(employee_count=Count('employees')).order_by('name')
+        return Response({
+            'total': total,
+            'active': status_counts.get('ACTIVE', 0),
+            'inactive': status_counts.get('INACTIVE', 0),
+            'on_leave': status_counts.get('ON_LEAVE', 0),
+            'terminated': status_counts.get('TERMINATED', 0),
+            'by_category': EmployeeCategorySerializer(categories, many=True).data,
+        }, status=status.HTTP_200_OK)
 
 
 class AdminAssignDeliveryView(APIView):
@@ -1912,7 +2044,7 @@ class AdminAssignDeliveryView(APIView):
         employee = Employee.objects.filter(id=employee_id).first()
         if not employee:
             return Response({'detail': 'Employee not found.'}, status=status.HTTP_404_NOT_FOUND)
-        if employee.status not in ['ACTIVE', 'AVAILABLE']:
+        if employee.employment_status != 'ACTIVE' or employee.status not in ['ACTIVE', 'AVAILABLE']:
             return Response({'detail': 'Employee is not available for delivery assignments.'}, status=status.HTTP_400_BAD_REQUEST)
 
         order.delivery_employee = employee
@@ -2710,4 +2842,3 @@ class AdminDeliverySettingsView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         settings_row = serializer.save()
         return Response(DeliverySettingsSerializer(settings_row).data, status=status.HTTP_200_OK)
-

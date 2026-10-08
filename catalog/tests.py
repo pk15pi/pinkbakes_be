@@ -9,7 +9,7 @@ from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from .models import Coupon, CouponRedemption, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review, AdminActivity, Employee
+from .models import Coupon, CouponRedemption, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, Refund, Review, AdminActivity, Employee, EmployeeCategory
 from . import inventory as inventory_service
 
 
@@ -1895,8 +1895,10 @@ class AdminOpsControlCenterTests(TestCase):
         self.delivery_user = User.objects.create_user(
             username='ops_delivery', email='ops_delivery@example.com', password='securepass123', is_staff=False,
         )
+        delivery_category, _ = EmployeeCategory.objects.get_or_create(name='Delivery Staff')
         self.employee = Employee.objects.create(
             user=self.delivery_user,
+            category=delivery_category,
             employee_id='EMP-OPS-1',
             name='Ops Rider',
             contact_number='9000000001',
@@ -2110,6 +2112,163 @@ class AdminOpsControlCenterTests(TestCase):
         order.refresh_from_db()
         self.assertIsNone(order.delivery_employee_id)
 
+
+class EmployeeManagementAPITests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(
+            username='employee_admin', password='securepass123', is_staff=True,
+        )
+        self.customer = User.objects.create_user(
+            username='employee_customer', password='securepass123',
+        )
+        self.delivery_category, _ = EmployeeCategory.objects.get_or_create(name='Delivery Staff')
+        self.chef_category, _ = EmployeeCategory.objects.get_or_create(name='Chef')
+        self.employee = Employee.objects.create(
+            employee_id='PB-EMP-001',
+            name='Asha Baker',
+            category=self.chef_category,
+            designation='Head Baker',
+            contact_number='+91 9876543210',
+            email='asha@example.com',
+            date_of_joining='2025-01-15',
+            address='Test address',
+            emergency_contact='9876543211',
+            status='AVAILABLE',
+        )
+
+    def test_employee_endpoints_require_admin(self):
+        for user in (None, self.customer):
+            self.client.force_authenticate(user=user)
+            for url in (
+                '/api/admin/employees/',
+                '/api/admin/employees/stats/',
+                '/api/admin/employee-categories/',
+            ):
+                response = self.client.get(url)
+                self.assertIn(response.status_code, (401, 403), msg=url)
+
+    def test_employee_list_preserves_array_response_and_supports_filtering(self):
+        self.client.force_authenticate(user=self.admin)
+        default_response = self.client.get('/api/admin/employees/')
+        self.assertEqual(default_response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(default_response.json(), list)
+        self.assertEqual(default_response.json()[0]['category_name'], 'Chef')
+
+        filtered = self.client.get('/api/admin/employees/', {
+            'search': 'asha@example.com',
+            'employment_status': 'ACTIVE',
+            'category': self.chef_category.id,
+            'date_from': '2025-01-01',
+            'date_to': '2025-12-31',
+            'page': 1,
+            'page_size': 10,
+        })
+        self.assertEqual(filtered.status_code, status.HTTP_200_OK)
+        self.assertEqual(filtered.json()['count'], 1)
+        self.assertEqual(filtered.json()['results'][0]['employee_id'], 'PB-EMP-001')
+
+        invalid_date = self.client.get('/api/admin/employees/', {'date_from': 'not-a-date'})
+        self.assertEqual(invalid_date.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_employee_create_update_and_soft_deactivate(self):
+        self.client.force_authenticate(user=self.admin)
+        created = self.client.post('/api/admin/employees/', {
+            'employee_id': 'PB-EMP-002',
+            'name': 'Ravi Rider',
+            'contact_number': '9876543212',
+            'category': self.delivery_category.id,
+        }, format='json')
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.content)
+        self.assertEqual(created.json()['category_name'], 'Delivery Staff')
+        employee_id = created.json()['id']
+
+        updated = self.client.patch(f'/api/admin/employees/{employee_id}/', {
+            'employment_status': 'ON_LEAVE',
+        }, format='json')
+        self.assertEqual(updated.status_code, status.HTTP_200_OK, updated.content)
+        self.assertEqual(updated.json()['employment_status'], 'ON_LEAVE')
+        self.assertEqual(updated.json()['status'], 'INACTIVE')
+
+        deleted = self.client.delete(f'/api/admin/employees/{self.employee.id}/')
+        self.assertEqual(deleted.status_code, status.HTTP_200_OK)
+        self.employee.refresh_from_db()
+        self.assertEqual(self.employee.employment_status, 'INACTIVE')
+        self.assertTrue(Employee.objects.filter(pk=self.employee.pk).exists())
+        self.assertTrue(AdminActivity.objects.filter(action='employee_deactivate', entity_id=self.employee.id).exists())
+
+    def test_legacy_employee_create_defaults_to_delivery_category(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post('/api/admin/employees/', {
+            'employee_id': 'PB-EMP-LEGACY',
+            'name': 'Legacy Client',
+            'contact_number': '9876543215',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        self.assertEqual(response.json()['category_name'], 'Delivery Staff')
+
+    def test_customer_order_employee_payload_does_not_include_hr_fields(self):
+        order = Order.objects.create(
+            user=self.customer,
+            order_number='EMPLOYEE-PRIVACY-1',
+            customer_name='Customer',
+            customer_email='customer@example.com',
+            customer_mobile='9876543210',
+            shipping_address='Test',
+            city='Mumbai',
+            state='MH',
+            postal_code='400001',
+            country='India',
+            subtotal_amount=500,
+            total_amount=500,
+            delivery_employee=self.employee,
+        )
+        from .serializers import OrderSerializer
+        employee_payload = OrderSerializer(order).data['delivery_employee']
+        self.assertNotIn('address', employee_payload)
+        self.assertNotIn('emergency_contact', employee_payload)
+        self.assertNotIn('employment_status', employee_payload)
+
+    def test_employee_cannot_be_assigned_to_inactive_category_and_unique_id_is_validated(self):
+        inactive_category = EmployeeCategory.objects.create(name='Seasonal', is_active=False)
+        self.client.force_authenticate(user=self.admin)
+        inactive_assignment = self.client.post('/api/admin/employees/', {
+            'employee_id': 'PB-EMP-003',
+            'name': 'Inactive Category',
+            'contact_number': '9876543213',
+            'category': inactive_category.id,
+        }, format='json')
+        self.assertEqual(inactive_assignment.status_code, status.HTTP_400_BAD_REQUEST)
+
+        duplicate_id = self.client.post('/api/admin/employees/', {
+            'employee_id': self.employee.employee_id,
+            'name': 'Duplicate ID',
+            'contact_number': '9876543214',
+            'category': self.delivery_category.id,
+        }, format='json')
+        self.assertEqual(duplicate_id.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_categories_crud_and_statistics(self):
+        self.client.force_authenticate(user=self.admin)
+        created = self.client.post('/api/admin/employee-categories/', {'name': 'Quality Assurance'}, format='json')
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.content)
+        category_id = created.json()['id']
+        self.assertEqual(created.json()['employee_count'], 0)
+
+        duplicate = self.client.post('/api/admin/employee-categories/', {'name': 'chef'}, format='json')
+        self.assertEqual(duplicate.status_code, status.HTTP_400_BAD_REQUEST)
+
+        disabled = self.client.patch(f'/api/admin/employee-categories/{category_id}/', {'is_active': False}, format='json')
+        self.assertEqual(disabled.status_code, status.HTTP_200_OK)
+        self.assertFalse(disabled.json()['is_active'])
+
+        statistics = self.client.get('/api/admin/employees/stats/')
+        self.assertEqual(statistics.status_code, status.HTTP_200_OK)
+        self.assertEqual(statistics.json()['total'], 1)
+        self.assertEqual(statistics.json()['active'], 1)
+        category_counts = {category['name']: category['employee_count'] for category in statistics.json()['by_category']}
+        self.assertEqual(category_counts['Chef'], 1)
+        self.assertEqual(category_counts['Quality Assurance'], 0)
 
 
 class CartEdgeCaseTests(TestCase):
@@ -2419,4 +2578,3 @@ class AdminQaMajorsRegressionTests(TestCase):
         for r in pdata['results']:
             self.assertIn(r['status'], ('requested', 'pending', 'processing'))
         self.assertTrue(any(r.get('order_number') == 'QA-PAY-100' for r in pdata['results']))
-
