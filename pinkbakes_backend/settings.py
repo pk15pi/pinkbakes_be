@@ -33,8 +33,8 @@ def _env_list(name, default):
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://www.pinkbakes.com')
 PUBLIC_SITE_URL = os.environ.get('PUBLIC_SITE_URL', FRONTEND_URL)
 PUBLIC_CONTACT_PHONE = os.environ.get('PUBLIC_CONTACT_PHONE', '+916033430700')
-EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
-EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtpout.secureserver.net')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '465'))
 EMAIL_USE_TLS = _env_bool('EMAIL_USE_TLS', True)
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', 'pinkbakes@pinkbakes.com')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
@@ -67,7 +67,8 @@ else:
 
 # SECURITY: DEBUG defaults True for local; production must set DJANGO_DEBUG=false.
 DEBUG = _DEBUG_EARLY = False
-SECRET_KEY = (os.environ.get('DJANGO_SECRET_KEY') or '').strip()
+# SECRET_KEY = (os.environ.get('DJANGO_SECRET_KEY') or '').strip()
+SECRET_KEY = "dfadsfasdfsadfasdfdsfasdf"
 if not SECRET_KEY:
     if DEBUG:
         # Dev-only placeholder. Never deploy with DEBUG=true.
