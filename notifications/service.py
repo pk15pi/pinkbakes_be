@@ -368,7 +368,7 @@ def notify_staff_new_order(order):
         context={
             'order': order,
             'title': f'New order {order.order_number}',
-            'message': f'New order {order.order_number} from {getattr(order, "customer_name", "")} — Rs.{getattr(order, "total_amount", "")}',
+            'message': f'New order {order.order_number} from {getattr(order, "customer_name", "")} — ₹{getattr(order, "total_amount", "")}',
         },
         idempotency_key=f'new_order:{order.pk}',
         reference_type='order',

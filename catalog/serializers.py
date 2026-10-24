@@ -158,8 +158,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
             'unit_price',
             'quantity',
             'subtotal',
+            'options',
         ]
-        read_only_fields = ['id', 'product_name', 'product_image', 'unit_price', 'subtotal']
+        read_only_fields = ['id', 'product_name', 'product_image', 'unit_price', 'subtotal', 'options']
 
     def get_product_name(self, obj):
         return obj.product_name or (obj.product.name if obj.product else 'Product')

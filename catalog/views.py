@@ -4,6 +4,7 @@ import json
 import math
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.core.cache import cache
@@ -130,6 +131,72 @@ class PaymentService:
             subtotal += (product.discounted_price * quantity)
         return subtotal.quantize(Decimal('0.01'))
 
+    CAKE_SIZE_OPTIONS = ('0.5 kg', '1 kg', '1.5 kg', '2 kg')
+    CAKE_MESSAGE_MAX_LENGTH = 60
+    DELIVERY_DATE_MAX_DAYS_AHEAD = 365
+
+    @staticmethod
+    def is_eggless_product(product):
+        text = ' '.join([
+            str(getattr(product, 'category', '') or ''),
+            str(getattr(product, 'name', '') or ''),
+            str(getattr(product, 'badge', '') or ''),
+        ]).lower()
+        return 'eggless' in text
+
+    @staticmethod
+    def clean_item_options(raw, product):
+        """
+        Whitelist + validate the optional per-line choices from the product popup.
+        Returns a dict with only the recognised keys, or None when nothing was chosen.
+        Unknown keys are dropped; invalid values raise ValueError (400 to the client).
+        """
+        if raw in (None, '', {}):
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError('Item options must be an object.')
+        cleaned = {}
+        size = raw.get('size')
+        if size not in (None, ''):
+            if not isinstance(size, str) or size.strip() not in PaymentService.CAKE_SIZE_OPTIONS:
+                raise ValueError('Please choose a valid cake size.')
+            cleaned['size'] = size.strip()
+        eggless = raw.get('eggless')
+        if eggless not in (None, ''):
+            if not isinstance(eggless, bool):
+                raise ValueError('Eggless preference must be true or false.')
+            # Already-eggless cakes do not offer the choice; nothing to record.
+            if eggless and not PaymentService.is_eggless_product(product):
+                cleaned['eggless'] = True
+        message = raw.get('message')
+        if message not in (None, ''):
+            if not isinstance(message, str):
+                raise ValueError('Cake message must be text.')
+            message = ' '.join(''.join(ch for ch in message if ch.isprintable()).split())
+            if len(message) > PaymentService.CAKE_MESSAGE_MAX_LENGTH:
+                raise ValueError(
+                    f'Cake message must be at most {PaymentService.CAKE_MESSAGE_MAX_LENGTH} characters.'
+                )
+            if message:
+                cleaned['message'] = message
+        delivery_date = raw.get('delivery_date')
+        if delivery_date not in (None, ''):
+            try:
+                parsed = date.fromisoformat(str(delivery_date).strip())
+            except ValueError:
+                raise ValueError('Delivery date must be a valid date (YYYY-MM-DD).')
+            try:
+                store_tz = ZoneInfo(getattr(settings, 'STORE_TIME_ZONE', '') or 'Asia/Kolkata')
+            except Exception:
+                store_tz = timezone.get_current_timezone()
+            today = timezone.now().astimezone(store_tz).date()
+            if parsed < today:
+                raise ValueError('Delivery date cannot be in the past.')
+            if (parsed - today).days > PaymentService.DELIVERY_DATE_MAX_DAYS_AHEAD:
+                raise ValueError('Delivery date is too far in the future.')
+            cleaned['delivery_date'] = parsed.isoformat()
+        return cleaned or None
+
     @staticmethod
     def ensure_valid_cart(items):
         normalized = []
@@ -159,6 +226,7 @@ class PaymentService:
                 'product': product,
                 'quantity': quantity,
                 'unit_price': product.discounted_price,
+                'options': PaymentService.clean_item_options(item.get('options'), product),
             })
         # Re-check aggregated quantities under current stock.
         totals = {}
@@ -723,6 +791,7 @@ class PaymentCreateView(APIView):
                     unit_price=item['unit_price'],
                     quantity=item['quantity'],
                     subtotal=(item['unit_price'] * item['quantity']).quantize(Decimal('0.01')),
+                    options=item.get('options'),
                 )
 
             if coupon_code:
@@ -1621,6 +1690,7 @@ class OrderCheckoutView(APIView):
                     unit_price=row['unit_price'],
                     quantity=row['quantity'],
                     subtotal=(row['unit_price'] * row['quantity']).quantize(Decimal('0.01')),
+                    options=row.get('options'),
                 )
 
             if coupon_code:

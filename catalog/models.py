@@ -296,6 +296,9 @@ class OrderItem(models.Model):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     quantity = models.PositiveIntegerField(default=1)
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # Customer choices from the product popup (size, eggless, message, delivery_date).
+    # Nullable/additive: legacy rows and option-less cart lines keep NULL.
+    options = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

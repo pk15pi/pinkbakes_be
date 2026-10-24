@@ -161,8 +161,8 @@ def compute_delivery(
         result["zone"] = zone
         result["zone_id"] = zone.id
         result["message"] = (
-            f"Minimum order amount of Rs.{min_order} required for delivery to this area "
-            f"(current merchandise total after coupon: Rs.{subtotal})."
+            f"Minimum order amount of ₹{min_order} required for delivery to this area "
+            f"(current merchandise total after coupon: ₹{subtotal})."
         )
         if zone:
             result["eta_min_minutes"] = zone.eta_min_minutes

@@ -2634,3 +2634,81 @@ class DeliveryTrackingRegressionTests(TestCase):
         response = self.client.post(self.location_url, {'latitude': '22.5726', 'longitude': '88.3639', 'accuracy': '12'}, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(self.order.delivery_locations.count(), 1)
+
+
+class OrderItemOptionsRegressionTests(TestCase):
+    """Bug 017: product popup options (size/eggless/message/delivery date) reach the order."""
+
+    def setUp(self):
+        from datetime import timedelta
+        self.client = APIClient()
+        self.user = User.objects.create_user(username='opts', email='opts@example.com', password='Pass12345!')
+        self.client.force_authenticate(user=self.user)
+        common = dict(
+            price=Decimal('800.00'), is_active=True, status='published', availability='in_stock',
+            available_quantity=20, reserved_quantity=0, sold_quantity=0, low_stock_threshold=2,
+        )
+        self.product = Product.objects.create(name='Options Truffle', category='Chocolate Cakes', **common)
+        self.eggless_product = Product.objects.create(name='Eggless Options Cake', category='Eggless Cakes', **common)
+        self.future = (timezone.now() + timedelta(days=3)).date().isoformat()
+
+    def _payload(self, items):
+        return {
+            'items': items,
+            'customer_name': 'Opts', 'customer_email': 'opts@example.com', 'customer_mobile': '9876543210',
+            'shipping_address': '1 Test Street', 'city': 'Mumbai', 'state': 'Maharashtra',
+            'postal_code': '400001', 'country': 'India',
+        }
+
+    def test_options_are_saved_and_returned(self):
+        opts = {'size': '1.5 kg', 'eggless': True, 'message': '  Happy   Birthday Riya ', 'delivery_date': self.future, 'evil': 'x'}
+        response = self.client.post('/api/orders/checkout/', self._payload([{'id': self.product.id, 'quantity': 1, 'options': opts}]), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        item = response.json()['items'][0]
+        expected = {'size': '1.5 kg', 'eggless': True, 'message': 'Happy Birthday Riya', 'delivery_date': self.future}
+        self.assertEqual(item['options'], expected)
+        self.assertEqual(OrderItem.objects.get(id=item['id']).options, expected)
+        detail = self.client.get(f"/api/orders/{response.json()['id']}/")
+        self.assertEqual(detail.json()['items'][0]['options'], expected)
+
+    def test_same_product_with_different_options_stays_two_lines(self):
+        response = self.client.post('/api/orders/checkout/', self._payload([
+            {'id': self.product.id, 'quantity': 1, 'options': {'size': '1 kg', 'message': 'A'}},
+            {'id': self.product.id, 'quantity': 2, 'options': {'size': '2 kg', 'message': 'B'}},
+        ]), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        items = response.json()['items']
+        self.assertEqual([(i['quantity'], i['options']['size']) for i in items], [(1, '1 kg'), (2, '2 kg')])
+
+    def test_legacy_payload_without_options_still_works(self):
+        response = self.client.post('/api/orders/checkout/', self._payload([{'id': self.product.id, 'quantity': 1}]), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        self.assertIsNone(response.json()['items'][0]['options'])
+
+    def test_eggless_flag_not_recorded_for_already_eggless_cake(self):
+        response = self.client.post('/api/orders/checkout/', self._payload([
+            {'id': self.eggless_product.id, 'quantity': 1, 'options': {'size': '1 kg', 'eggless': True}},
+        ]), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        self.assertEqual(response.json()['items'][0]['options'], {'size': '1 kg'})
+
+    def test_invalid_options_rejected_without_creating_order(self):
+        from datetime import timedelta
+        past = (timezone.now() - timedelta(days=3)).date().isoformat()
+        bad_options = [
+            'not-an-object',
+            {'size': '10 kg'},
+            {'eggless': 'yes'},
+            {'message': 'x' * 61},
+            {'message': 123},
+            {'delivery_date': 'tomorrow'},
+            {'delivery_date': past},
+        ]
+        for opts in bad_options:
+            response = self.client.post('/api/orders/checkout/', self._payload([{'id': self.product.id, 'quantity': 1, 'options': opts}]), format='json')
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, opts)
+        self.assertFalse(Order.objects.filter(user=self.user).exists())
+
+    def test_cart_validate_accepts_options(self):
+        response = self.client.post('/api/cart/validate/', {'items': [{'id': self.product.id, 'quantity': 1, 'options': {'size': '1 kg'}}]}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)

@@ -163,12 +163,12 @@ def build_order_confirmation_email_html(order):
         qty = getattr(item, 'quantity', 1)
         sub = getattr(item, 'subtotal', 0)
         name = getattr(item, 'product_name', 'Item')
-        price_bit = f" @ Rs.{unit}" if unit is not None else ''
+        price_bit = f" @ ₹{unit}" if unit is not None else ''
         item_rows += (
             f"<tr>"
             f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8;'>{name}</td>"
             f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8; text-align:center;'>{qty}{price_bit}</td>"
-            f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8; text-align:right;'>Rs.{sub}</td>"
+            f"<td style='padding:8px 0; border-bottom:1px solid #f2dfe8; text-align:right;'>₹{sub}</td>"
             f"</tr>"
         )
     if not item_rows:
@@ -188,12 +188,12 @@ def build_order_confirmation_email_html(order):
     if coupon_code or float(discount_amount or 0) > 0 or float(coupon_discount or 0) > 0:
         shown = coupon_discount or discount_amount
         coupon_label = f' ({coupon_code})' if coupon_code else ''
-        discount_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Discount{coupon_label}:</strong> -Rs.{shown}</p>"
+        discount_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Discount{coupon_label}:</strong> -₹{shown}</p>"
 
-    delivery_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Delivery charge:</strong> Rs.{delivery_fee}</p>"
+    delivery_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Delivery charge:</strong> ₹{delivery_fee}</p>"
     tax_block = ''
     if float(tax_amount or 0) > 0:
-        tax_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Tax:</strong> Rs.{tax_amount}</p>"
+        tax_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Tax:</strong> ₹{tax_amount}</p>"
     eta_block = f"<p style='font-size:14px; margin:0 0 6px;'><strong>Estimated delivery:</strong> {eta_text}</p>" if eta_text else ''
 
     return f"""
@@ -220,11 +220,11 @@ def build_order_confirmation_email_html(order):
               </tr>
               {item_rows}
             </table>
-            <p style="font-size:14px; margin:12px 0 6px;"><strong>Subtotal:</strong> Rs.{subtotal_amount}</p>
+            <p style="font-size:14px; margin:12px 0 6px;"><strong>Subtotal:</strong> ₹{subtotal_amount}</p>
             {discount_block}
             {delivery_block}
             {tax_block}
-            <p style="font-size:16px; margin:8px 0 16px;"><strong>Total paid:</strong> Rs.{total_amount}</p>
+            <p style="font-size:16px; margin:8px 0 16px;"><strong>Total paid:</strong> ₹{total_amount}</p>
             <p style="font-size:14px; margin:0 0 6px;"><strong>Delivery address:</strong><br>{address_lines}</p>
             {eta_block}
             <p style="font-size:14px; line-height:1.6; color:#5d4753; margin:20px 0 0;">
@@ -304,11 +304,11 @@ def build_refund_email_html(order, refund, stage='initiated'):
     amount = getattr(refund, 'amount', 0)
     refund_status = getattr(refund, 'status', '')
     if stage == 'completed':
-        body = f"Your refund of <strong>Rs.{amount}</strong> for order <strong>{order_number}</strong> has been completed."
+        body = f"Your refund of <strong>₹{amount}</strong> for order <strong>{order_number}</strong> has been completed."
     elif stage == 'failed':
-        body = f"We could not complete the refund of <strong>Rs.{amount}</strong> for order <strong>{order_number}</strong>. Our team will review this shortly."
+        body = f"We could not complete the refund of <strong>₹{amount}</strong> for order <strong>{order_number}</strong>. Our team will review this shortly."
     else:
-        body = f"A refund of <strong>Rs.{amount}</strong> for order <strong>{order_number}</strong> has been initiated. Current status: <strong>{refund_status}</strong>."
+        body = f"A refund of <strong>₹{amount}</strong> for order <strong>{order_number}</strong> has been initiated. Current status: <strong>{refund_status}</strong>."
     return f"""
     <html>
       <body style="font-family: Arial, sans-serif; background:#fff7fb; padding:24px; color:#3a2a34;">

@@ -176,7 +176,7 @@ def validate_coupon(user, code, cart_items, *, lock=False):
 
     if coupon.minimum_order_amount and full_subtotal < _quantize(coupon.minimum_order_amount):
         raise CouponError(
-            f'Minimum order amount of Rs.{_quantize(coupon.minimum_order_amount)} required for this coupon.'
+            f'Minimum order amount of ₹{_quantize(coupon.minimum_order_amount)} required for this coupon.'
         )
 
     if coupon.new_customers_only and not _is_new_customer(user):
