@@ -10,6 +10,7 @@ from rest_framework.test import APIClient
 
 from notifications import events as E
 from notifications.defaults import seed_channel_configs, seed_email_templates
+from notifications.channels.sms import SmsChannelAdapter
 from notifications.models import (
     InAppNotification,
     NotificationChannelConfig,
@@ -124,6 +125,12 @@ class NotificationServiceTests(TestCase):
         self.assertTrue(any(r.get('status') == E.STATUS_SENT for r in results))
         self.assertEqual(len(mail.outbox), 1)
 
+    @override_settings(
+        SMS_PROVIDER='',
+        TWILIO_ACCOUNT_SID='',
+        TWILIO_AUTH_TOKEN='',
+        TWILIO_FROM_NUMBER='',
+    )
     def test_sms_skipped_when_unconfigured(self):
         results = notify(
             E.LOGIN_OTP_REQUESTED,
@@ -138,6 +145,31 @@ class NotificationServiceTests(TestCase):
         self.assertIsNotNone(log)
         self.assertEqual(log.status, E.STATUS_SKIPPED)
         self.assertNotIn('123456', log.last_error)
+
+    @override_settings(
+        SMS_PROVIDER='twilio',
+        TWILIO_ACCOUNT_SID='AC00000000000000000000000000000000',
+        TWILIO_AUTH_TOKEN='test-token',
+        TWILIO_FROM_NUMBER='+15551234567',
+    )
+    @mock.patch('notifications.channels.sms.Client')
+    def test_sms_sends_login_otp_through_twilio(self, client_class):
+        client = client_class.return_value
+        client.messages.create.return_value.sid = 'SM123'
+
+        result = SmsChannelAdapter().send(
+            event=E.LOGIN_OTP_REQUESTED,
+            phone='+15557654321',
+            context={'otp': '123456', 'message': 'Your login code was sent.'},
+        )
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['message_sid'], 'SM123')
+        client.messages.create.assert_called_once_with(
+            body='Your PinkBakes login OTP is 123456. It expires in 10 minutes.',
+            from_='+15551234567',
+            to='+15557654321',
+        )
 
     @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
     def test_idempotency_prevents_duplicate_confirmation_email(self):

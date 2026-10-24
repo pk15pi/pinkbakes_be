@@ -2578,3 +2578,59 @@ class AdminQaMajorsRegressionTests(TestCase):
         for r in pdata['results']:
             self.assertIn(r['status'], ('requested', 'pending', 'processing'))
         self.assertTrue(any(r.get('order_number') == 'QA-PAY-100' for r in pdata['results']))
+
+
+class DeliveryTrackingRegressionTests(TestCase):
+    """QA 2026-10-24: tracking isolation and courier location input validation."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.staff = User.objects.create_user(username='trk_staff', password='pass12345', is_staff=True)
+        self.owner = User.objects.create_user(username='trk_owner', password='pass12345', email='owner@ex.com')
+        self.other = User.objects.create_user(username='trk_other', password='pass12345', email='other@ex.com')
+        rider_user = User.objects.create_user(username='trk_rider', password='pass12345')
+        category, _ = EmployeeCategory.objects.get_or_create(name='Delivery Staff')
+        self.employee = Employee.objects.create(
+            user=rider_user, category=category, employee_id='EMP-TRK-1', name='Trk Rider',
+            contact_number='9000000009', status='AVAILABLE',
+        )
+        self.order = Order.objects.create(
+            user=self.owner, order_number='TRK-0001', customer_name='Owner', customer_email='owner@ex.com',
+            customer_mobile='9876543210', shipping_address='1 Test St', city='Kolkata', state='WB',
+            postal_code='700001', country='India', subtotal_amount=500, total_amount=500,
+            status='OUT_FOR_DELIVERY', payment_status='paid', delivery_employee=self.employee,
+        )
+        self.tracking_url = f'/api/catalog/orders/{self.order.id}/tracking/'
+        self.location_url = f'/api/catalog/orders/{self.order.id}/location/'
+
+    def test_tracking_visible_to_owner_only(self):
+        self.client.force_authenticate(user=self.owner)
+        self.assertEqual(self.client.get(self.tracking_url).status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(user=self.other)
+        self.assertIn(self.client.get(self.tracking_url).status_code, (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND))
+        self.client.force_authenticate(user=None)
+        self.assertIn(self.client.get(self.tracking_url).status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_customer_cannot_post_courier_location(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(self.location_url, {'latitude': '22.5', 'longitude': '88.3'}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_invalid_coordinates_return_400_not_500(self):
+        self.client.force_authenticate(user=self.staff)
+        for payload in (
+            {'latitude': 'abc', 'longitude': '88.3'},
+            {'latitude': '22.5', 'longitude': '88.3', 'accuracy': 'x'},
+            {'latitude': '91', 'longitude': '88.3'},
+            {'latitude': '22.5', 'longitude': '-181'},
+            {'latitude': 'nan', 'longitude': '88.3'},
+        ):
+            response = self.client.post(self.location_url, payload, format='json')
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, payload)
+        self.assertFalse(self.order.delivery_locations.exists())
+
+    def test_valid_coordinates_are_saved(self):
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(self.location_url, {'latitude': '22.5726', 'longitude': '88.3639', 'accuracy': '12'}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.order.delivery_locations.count(), 1)

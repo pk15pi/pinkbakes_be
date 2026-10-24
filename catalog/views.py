@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import math
 from datetime import date
 from decimal import Decimal
 
@@ -2260,12 +2261,21 @@ class DeliveryLocationUpdateView(APIView):
         if latitude is None or longitude is None:
             return Response({'detail': 'Latitude and longitude are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+            accuracy = float(request.data.get('accuracy') or 0)
+        except (TypeError, ValueError):
+            return Response({'detail': 'Latitude, longitude and accuracy must be numbers.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not (math.isfinite(latitude) and math.isfinite(longitude) and math.isfinite(accuracy)) or not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            return Response({'detail': 'Latitude or longitude is out of range.'}, status=status.HTTP_400_BAD_REQUEST)
+
         location = DeliveryLocation.objects.create(
             order=order,
             employee=employee,
-            latitude=float(latitude),
-            longitude=float(longitude),
-            accuracy=float(request.data.get('accuracy') or 0),
+            latitude=latitude,
+            longitude=longitude,
+            accuracy=accuracy,
         )
         return Response(DeliveryLocationSerializer(location).data, status=status.HTTP_201_CREATED)
 
