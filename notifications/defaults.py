@@ -51,10 +51,40 @@ DEFAULT_CHANNEL_MAP = {
     (E.LOW_STOCK, E.CHANNEL_EMAIL): True,
     (E.ADMIN_PAYMENT_FAILED, E.CHANNEL_IN_APP): True,
     (E.ADMIN_REFUND_FAILED, E.CHANNEL_IN_APP): True,
+    # Phase 14: SMS / WhatsApp / email for order lifecycle + staff alerts
+    (E.ORDER_CREATED, E.CHANNEL_EMAIL): True,
+    (E.ORDER_CREATED, E.CHANNEL_SMS): True,
+    (E.ORDER_CREATED, E.CHANNEL_WHATSAPP): True,
+    (E.ORDER_CONFIRMED, E.CHANNEL_SMS): True,
+    (E.ORDER_CONFIRMED, E.CHANNEL_WHATSAPP): True,
+    (E.ORDER_CANCELLED, E.CHANNEL_SMS): True,
+    (E.ORDER_CANCELLED, E.CHANNEL_WHATSAPP): True,
+    (E.ORDER_OUT_FOR_DELIVERY, E.CHANNEL_SMS): True,
+    (E.ORDER_OUT_FOR_DELIVERY, E.CHANNEL_WHATSAPP): True,
+    (E.DELIVERY_COMPLETED, E.CHANNEL_SMS): True,
+    (E.DELIVERY_COMPLETED, E.CHANNEL_WHATSAPP): True,
+    (E.NEW_ORDER, E.CHANNEL_EMAIL): True,
+    (E.NEW_ORDER, E.CHANNEL_SMS): True,
+    (E.NEW_ORDER, E.CHANNEL_WHATSAPP): True,
+    (E.LOW_STOCK, E.CHANNEL_WHATSAPP): True,
 }
 
 # Simple {{var}} email fallbacks when no DB template row / dedicated helper.
 DEFAULT_EMAIL_TEMPLATES = {
+    E.ORDER_CREATED: {
+        'subject': 'We received your PinkBakes order {{order_number}}',
+        'body_html': (
+            '<p>Hi {{customer_name}},</p><p>Thank you for your order <strong>{{order_number}}</strong> '
+            '(total Rs. {{total_amount}}). We will confirm it shortly.</p>'
+            '<p><a href="{{tracking_url}}">Track your order</a></p>'
+        ),
+        'body_text': '',
+    },
+    E.NEW_ORDER: {
+        'subject': 'New order {{order_number}}',
+        'body_html': '<p>{{message}}</p>',
+        'body_text': '',
+    },
     E.PASSWORD_CHANGED: {
         'subject': 'Your PinkBakes password was changed',
         'body_html': (

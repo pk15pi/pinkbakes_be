@@ -778,3 +778,17 @@ class CartItem(models.Model):
 
     def __str__(self):
         return f'{self.quantity} x {self.product_id}'
+
+
+class WishlistItem(models.Model):
+    """A cake saved to a signed-in customer's wishlist (guests keep theirs in the browser)."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='wishlist_items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='wishlist_items')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+        constraints = [models.UniqueConstraint(fields=['user', 'product'], name='uniq_wishlist_user_product')]
+
+    def __str__(self):
+        return f'{self.user_id} -> {self.product_id}'

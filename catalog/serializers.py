@@ -812,3 +812,18 @@ class DeliverySettingsSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['updated_at']
+
+
+class PublicReviewSerializer(serializers.ModelSerializer):
+    """Storefront view of a review: no user ids, moderation notes or approver."""
+    user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Review
+        fields = ['id', 'user_name', 'rating', 'comment', 'status', 'created_at']
+        read_only_fields = fields
+
+    def get_user_name(self, obj):
+        if obj.user:
+            return obj.user.get_full_name() or obj.user.username
+        return obj.name or 'Customer'

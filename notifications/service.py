@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 
 from . import events as E
 from .channels import get_adapter
 from .defaults import DEFAULT_CHANNEL_MAP, DEFAULT_EMAIL_TEMPLATES
+from .phone import normalize_phone, staff_alert_phones
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -67,7 +69,8 @@ def _preference_allows(event, channel, user) -> bool:
         if 'PROMO' in event or event.endswith('_PROMOTIONAL'):
             return prefs.email_promotional
         return True
-    if channel == E.CHANNEL_SMS:
+    # WhatsApp follows the SMS (phone) preferences; no separate column needed.
+    if channel in (E.CHANNEL_SMS, E.CHANNEL_WHATSAPP):
         if event in _PREF_SMS_ORDER:
             return prefs.sms_order_updates
         return prefs.sms_promotional or prefs.sms_order_updates
@@ -136,8 +139,20 @@ def _already_sent(idempotency_key: str) -> bool:
 
 def _create_log(**kwargs):
     from .models import NotificationLog
+    key = kwargs.get('idempotency_key') or ''
+    if key:
+        # A previous attempt (skipped/failed) owns this unique key: reuse the row instead of
+        # hitting the unique constraint (which would poison an outer atomic block).
+        existing = NotificationLog.objects.filter(idempotency_key=key).first()
+        if existing is not None:
+            for field in ('status', 'recipient', 'last_error', 'user', 'reference_type', 'reference_id'):
+                if field in kwargs:
+                    setattr(existing, field, kwargs[field])
+            existing.save()
+            return existing
     try:
-        return NotificationLog.objects.create(**kwargs)
+        with transaction.atomic():
+            return NotificationLog.objects.create(**kwargs)
     except IntegrityError:
         # Race on unique idempotency_key
         existing = NotificationLog.objects.filter(idempotency_key=kwargs.get('idempotency_key') or '').first()
@@ -179,8 +194,17 @@ def notify(
     targets = []
     if admin or event in E.ADMIN_EVENTS:
         admin_users = context.pop('admin_users', None) or _staff_users()
+        seen_phones = set()
         for au in admin_users:
-            targets.append({'user': au, 'email': getattr(au, 'email', None), 'phone': None})
+            profile = getattr(au, 'profile', None)
+            au_phone = normalize_phone(getattr(profile, 'mobile_number', '') if profile is not None else '')
+            if au_phone:
+                seen_phones.add(au_phone)
+            targets.append({'user': au, 'email': getattr(au, 'email', None), 'phone': au_phone or None})
+        # Extra staff numbers from NOTIFICATION_STAFF_PHONES (SMS/WhatsApp only).
+        for staff_phone in staff_alert_phones():
+            if staff_phone not in seen_phones:
+                targets.append({'user': None, 'email': None, 'phone': staff_phone, 'phone_only': True})
         if user is not None and event not in E.ADMIN_EVENTS:
             targets.append({'user': user, 'email': email, 'phone': phone})
     else:
@@ -195,11 +219,16 @@ def notify(
         t_user = target['user']
         t_email = target['email']
         t_phone = target['phone']
+        phone_only = target.get('phone_only', False)
 
         for channel in channel_list:
+            if phone_only and channel not in (E.CHANNEL_SMS, E.CHANNEL_WHATSAPP):
+                continue
             base_key = idempotency_key
             if base_key and t_user is not None:
                 per_key = f'{base_key}:{channel}:u{t_user.pk}'
+            elif base_key and phone_only:
+                per_key = f"{base_key}:{channel}:p{hashlib.sha256(t_phone.encode()).hexdigest()[:12]}"
             elif base_key:
                 per_key = f'{base_key}:{channel}'
             else:
@@ -256,7 +285,7 @@ def notify(
                 idempotency_key=per_key or '',
                 reference_type=reference_type or context.get('reference_type', ''),
                 reference_id=str(reference_id or context.get('reference_id', '')),
-                recipient=_mask_recipient(t_email or phone or ''),
+                recipient=_mask_recipient(t_email or t_phone or ''),
             )
 
             result = adapter.send(
@@ -322,6 +351,7 @@ def notify_order_confirmed(order):
         E.ORDER_CONFIRMED,
         user=user,
         email=getattr(order, 'customer_email', None),
+        phone=getattr(order, 'customer_mobile', None),
         context={'order': order, 'message': f'Order {order.order_number} confirmed.'},
         idempotency_key=f'order_confirmed:{order.pk}',
         reference_type='order',
@@ -336,6 +366,7 @@ def notify_payment_success(order, payment=None):
         E.PAYMENT_SUCCESS,
         user=user,
         email=getattr(order, 'customer_email', None),
+        phone=getattr(order, 'customer_mobile', None),
         context={'order': order, 'payment': payment, 'message': f'Payment successful for {order.order_number}.'},
         idempotency_key=key,
         reference_type='payment',
@@ -355,8 +386,33 @@ def notify_order_cancelled(order, reason=''):
         E.ORDER_CANCELLED,
         user=user,
         email=getattr(order, 'customer_email', None),
+        phone=getattr(order, 'customer_mobile', None),
         context={'order': order, 'reason': reason, 'message': msg},
         idempotency_key=f'order_cancelled:{order.pk}',
+        reference_type='order',
+        reference_id=str(order.pk),
+    )
+
+
+def notify_order_placed(order):
+    """Customer acknowledgement right after checkout (no payment gateway required)."""
+    user = getattr(order, 'user', None)
+    total = getattr(order, 'total_amount', '')
+    return notify(
+        E.ORDER_CREATED,
+        user=user,
+        email=getattr(order, 'customer_email', None),
+        phone=getattr(order, 'customer_mobile', None),
+        context={
+            'order': order,
+            'tracking_url': tracking_url_for_order(order),
+            'title': f'Order {order.order_number} received',
+            'message': (
+                f'Thanks for ordering from PinkBakes! We have received order {order.order_number} '
+                f'(total Rs. {total}). We will confirm it shortly. Track it: {tracking_url_for_order(order)}'
+            ),
+        },
+        idempotency_key=f'order_created:{order.pk}',
         reference_type='order',
         reference_id=str(order.pk),
     )

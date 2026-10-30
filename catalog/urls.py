@@ -84,6 +84,8 @@ from .views import (
     ReviewDetailView,
 )
 
+from .wishlist_views import WishlistItemDetailView, WishlistItemsView, WishlistMergeView, WishlistView
+
 urlpatterns = [
     path('admin/login/', AdminLoginView.as_view(), name='admin-login'),
     path('admin/logout/', AdminLogoutView.as_view(), name='admin-logout'),
@@ -141,6 +143,10 @@ urlpatterns = [
     path('admin/orders/<int:order_id>/refund/', AdminOrderRefundView.as_view(), name='admin-order-refund'),
     path('admin/refunds/', AdminRefundListView.as_view(), name='admin-refund-list'),
     path('cart/', CartView.as_view(), name='cart'),
+    path('wishlist/', WishlistView.as_view(), name='wishlist'),
+    path('wishlist/items/', WishlistItemsView.as_view(), name='wishlist-items'),
+    path('wishlist/items/<int:product_id>/', WishlistItemDetailView.as_view(), name='wishlist-item-detail'),
+    path('wishlist/merge/', WishlistMergeView.as_view(), name='wishlist-merge'),
     path('cart/merge/', CartMergeView.as_view(), name='cart-merge'),
     path('cart/validate/', CartValidateView.as_view(), name='cart-validate'),
     path('coupons/validate/', CouponValidateView.as_view(), name='coupon-validate'),

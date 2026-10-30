@@ -1,3 +1,4 @@
+import logging
 import hashlib
 import hmac
 import json
@@ -37,9 +38,10 @@ from .constants import CATALOG_CATEGORIES, CATEGORY_FALLBACK_IMAGES
 from .site_content import SlotError, resolve_delivery_slot
 from .throttles import CATALOG_READ_THROTTLES, DELIVERY_QUOTE_THROTTLES
 from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, EmployeeCategory, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
-from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeCategorySerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductListSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
+from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeCategorySerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductListSerializer, ProductSerializer, PublicReviewSerializer, RefundSerializer, ReviewSerializer
 from notifications import events as notification_events
 from notifications.service import (
+    notify_order_placed,
     notify as notify_event,
     notify_order_cancelled,
     notify_order_confirmed,
@@ -1347,8 +1349,28 @@ class ProductReviewListView(APIView):
         product = Product.objects.filter(id=product_id, is_active=True).first()
         if not product:
             return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
-        reviews = Review.objects.filter(product=product, status='approved').order_by('-created_at')
-        return Response(ReviewSerializer(reviews, many=True).data, status=status.HTTP_200_OK)
+        reviews = Review.objects.filter(product=product, status='approved').select_related('user').order_by('-created_at', '-id')
+        if 'page' not in request.query_params and 'page_size' not in request.query_params:
+            # Legacy un-paginated shape (approved only).
+            return Response(ReviewSerializer(reviews, many=True).data, status=status.HTTP_200_OK)
+        # Phase 16: paginated for the infinite-scroll review history.
+        rows, meta = paginate_queryset(reviews, request, default_page_size=10, max_page_size=50)
+        data = {
+            **meta,
+            'has_next': meta['page'] < meta['total_pages'],
+            'results': PublicReviewSerializer(rows, many=True).data,
+        }
+        if request.user.is_authenticated:
+            if meta['page'] == 1:
+                mine = Review.objects.filter(product=product, user=request.user).exclude(status='approved').order_by('-created_at')
+                data['mine'] = PublicReviewSerializer(mine, many=True).data
+            reviewed = Review.objects.filter(user=request.user, order_item__isnull=False).values_list('order_item_id', flat=True)
+            data['can_review'] = OrderItem.objects.filter(
+                product=product, order__user=request.user, order__status__iexact='DELIVERED',
+            ).exclude(id__in=reviewed).exists()
+        else:
+            data['can_review'] = False
+        return Response(data, status=status.HTTP_200_OK)
 
     def post(self, request, product_id):
         if not request.user.is_authenticated:
@@ -1799,6 +1821,16 @@ class OrderCheckoutView(APIView):
                 transaction.set_rollback(True)
                 return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Notifications must never break checkout (order is already committed here).
+        try:
+            notify_order_placed(order)
+        except Exception:
+            logging.getLogger(__name__).exception('notify_order_placed failed for order %s', order.pk)
+        try:
+            notify_staff_new_order(order)
+        except Exception:
+            logging.getLogger(__name__).exception('notify_staff_new_order failed for order %s', order.pk)
+
         return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_201_CREATED)
 
 
@@ -1806,7 +1838,15 @@ class OrderListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        orders = Order.objects.filter(user=request.user).prefetch_related('items', 'status_history', 'refunds').order_by('-created_at')
+        orders = Order.objects.filter(user=request.user).prefetch_related('items', 'status_history', 'refunds').order_by('-created_at', '-id')
+        if 'page' in request.query_params or 'page_size' in request.query_params:
+            # Phase 16: paginated order history (always scoped to the signed-in user).
+            rows, meta = paginate_queryset(orders, request, default_page_size=10, max_page_size=50)
+            return Response({
+                **meta,
+                'has_next': meta['page'] < meta['total_pages'],
+                'results': OrderSerializer(rows, many=True, context={'request': request}).data,
+            }, status=status.HTTP_200_OK)
         return Response({
             'count': orders.count(),
             'results': OrderSerializer(orders, many=True, context={'request': request}).data,
@@ -2292,6 +2332,7 @@ class AdminOrderStatusUpdateView(APIView):
                     notification_events.ORDER_OUT_FOR_DELIVERY,
                     user=getattr(order, 'user', None),
                     email=getattr(order, 'customer_email', None),
+                    phone=getattr(order, 'customer_mobile', None),
                     context=ctx,
                     idempotency_key=f'out_for_delivery:{order.pk}',
                     reference_type='order',
@@ -2302,6 +2343,7 @@ class AdminOrderStatusUpdateView(APIView):
                     notification_events.DELIVERY_COMPLETED,
                     user=getattr(order, 'user', None),
                     email=getattr(order, 'customer_email', None),
+                    phone=getattr(order, 'customer_mobile', None),
                     context=ctx,
                     idempotency_key=f'delivery_completed:{order.pk}',
                     reference_type='order',
@@ -2312,11 +2354,14 @@ class AdminOrderStatusUpdateView(APIView):
                     notification_events.ORDER_READY_FOR_DELIVERY,
                     user=getattr(order, 'user', None),
                     email=getattr(order, 'customer_email', None),
+                    phone=getattr(order, 'customer_mobile', None),
                     context=ctx,
                     idempotency_key=f'ready_for_delivery:{order.pk}',
                     reference_type='order',
                     reference_id=str(order.pk),
                 )
+            elif new_status == 'ORDER_CONFIRMED':
+                notify_order_confirmed(order)
             else:
                 notify_event(
                     notification_events.ORDER_STATUS_CHANGED,
