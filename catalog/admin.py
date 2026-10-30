@@ -37,6 +37,7 @@ class PaymentAdmin(admin.ModelAdmin):
     list_display = ('id', 'order', 'user', 'amount', 'status', 'gateway_order_id', 'gateway_payment_id', 'created_at')
     list_filter = ('status', 'gateway')
     search_fields = ('gateway_order_id', 'gateway_payment_id')
+    exclude = ('gateway_signature',)  # Phase 18: never expose gateway signatures
 
 
 @admin.register(Product)
@@ -105,3 +106,110 @@ class TestimonialAdmin(admin.ModelAdmin):
 class DeliverySlotAdmin(admin.ModelAdmin):
     list_display = ('label', 'start_time', 'end_time', 'sort_order', 'is_active')
     list_editable = ('sort_order', 'is_active')
+
+
+# ---- Phase 18: register every remaining catalog model ----
+from .models import (  # noqa: E402
+    AdminActivity, Cart, CartItem, DeliveryLocation, OrderItem, OrderStatusHistory,
+    ProductView, Review, WishlistItem,
+)
+
+
+@admin.register(Review)
+class ReviewAdmin(admin.ModelAdmin):
+    list_display = ('id', 'product', 'user', 'name', 'rating', 'status', 'created_at', 'approved_at')
+    list_filter = ('status', 'rating')
+    search_fields = ('name', 'comment', 'product__name', 'user__username')
+    ordering = ('-created_at',)
+    raw_id_fields = ('product', 'user', 'order', 'order_item', 'approved_by')
+    readonly_fields = ('created_at', 'updated_at', 'approved_at', 'rejected_at')
+
+
+@admin.register(ProductView)
+class ProductViewAdmin(admin.ModelAdmin):
+    list_display = ('id', 'product', 'user', 'created_at')
+    search_fields = ('product__name', 'user__username')
+    ordering = ('-created_at',)
+    raw_id_fields = ('product', 'user')
+    exclude = ('session_key', 'ip_address')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(OrderItem)
+class OrderItemAdmin(admin.ModelAdmin):
+    list_display = ('id', 'order', 'product_name', 'unit_price', 'quantity', 'subtotal', 'created_at')
+    search_fields = ('order__order_number', 'product_name')
+    ordering = ('-created_at',)
+    raw_id_fields = ('order', 'product')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(OrderStatusHistory)
+class OrderStatusHistoryAdmin(admin.ModelAdmin):
+    list_display = ('id', 'order', 'status', 'message', 'changed_by', 'created_at')
+    list_filter = ('status',)
+    search_fields = ('order__order_number', 'message')
+    ordering = ('-created_at',)
+    raw_id_fields = ('order', 'changed_by')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(DeliveryLocation)
+class DeliveryLocationAdmin(admin.ModelAdmin):
+    list_display = ('id', 'order', 'employee', 'latitude', 'longitude', 'accuracy', 'timestamp')
+    search_fields = ('order__order_number', 'employee__name')
+    ordering = ('-timestamp',)
+    raw_id_fields = ('order', 'employee')
+    readonly_fields = ('created_at',)
+
+
+@admin.register(AdminActivity)
+class AdminActivityAdmin(admin.ModelAdmin):
+    """Audit log: read-only in admin."""
+    list_display = ('id', 'admin_user', 'action', 'entity_type', 'entity_id', 'created_at')
+    list_filter = ('action', 'entity_type')
+    search_fields = ('description', 'admin_user__username', 'entity_type')
+    ordering = ('-created_at',)
+    exclude = ('ip_address',)
+    readonly_fields = ('admin_user', 'action', 'entity_type', 'entity_id', 'description', 'created_at')
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+class CartItemInline(admin.TabularInline):
+    model = CartItem
+    extra = 0
+    raw_id_fields = ('product',)
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(Cart)
+class CartAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'updated_at')
+    search_fields = ('user__username', 'user__email')
+    ordering = ('-updated_at',)
+    raw_id_fields = ('user',)
+    readonly_fields = ('created_at', 'updated_at')
+    inlines = (CartItemInline,)
+
+
+@admin.register(CartItem)
+class CartItemAdmin(admin.ModelAdmin):
+    list_display = ('id', 'cart', 'product', 'quantity', 'updated_at')
+    search_fields = ('product__name', 'cart__user__username')
+    ordering = ('-updated_at',)
+    raw_id_fields = ('cart', 'product')
+    readonly_fields = ('options_key', 'created_at', 'updated_at')
+
+
+@admin.register(WishlistItem)
+class WishlistItemAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'product', 'created_at')
+    search_fields = ('user__username', 'product__name')
+    ordering = ('-created_at',)
+    raw_id_fields = ('user', 'product')
+    readonly_fields = ('created_at',)

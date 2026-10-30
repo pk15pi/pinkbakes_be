@@ -866,6 +866,14 @@ class PaymentCreateView(APIView):
                 status='created',
             )
 
+        # Phase 18: the website checkout uses this endpoint, so acknowledge the order to the
+        # customer here ('order received'). Staff NEW_ORDER + ORDER_CONFIRMED fire once payment
+        # is confirmed (verify/webhook), so unpaid orders never alert staff or double-notify.
+        try:
+            notify_order_placed(order)
+        except Exception:
+            logging.getLogger(__name__).exception('notify_order_placed failed for order %s', order.pk)
+
         return Response({
             'payment_order_id': payment.gateway_order_id,
             'amount': amount_paise,
