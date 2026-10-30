@@ -21,6 +21,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .admin_reporting import AdminReportingService
+from . import cart as cart_service
 from . import coupons as coupon_service
 from . import delivery as delivery_service
 from . import inventory as inventory_service
@@ -334,6 +335,9 @@ class PaymentService:
             if order.status in ('PENDING', 'pending'):
                 order.status = 'ORDER_CONFIRMED'
             order.save(update_fields=['payment_status', 'status', 'updated_at'])
+            # Order is paid: empty the customer's saved cart.
+            if order.user_id:
+                cart_service.clear_cart(order.user_id)
 
             has_confirm_history = OrderStatusHistory.objects.filter(
                 order=order, status='ORDER_CONFIRMED'
@@ -3010,3 +3014,42 @@ class AdminDeliverySettingsView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         settings_row = serializer.save()
         return Response(DeliverySettingsSerializer(settings_row).data, status=status.HTTP_200_OK)
+
+
+class CartView(APIView):
+    """Signed-in customer's saved cart. GET re-prices from the catalog; PUT replaces it."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return Response(cart_service.serialize_cart(request.user, request))
+
+    def put(self, request):
+        raw = request.data.get('items') if isinstance(request.data, dict) else None
+        try:
+            lines, skipped = cart_service.parse_lines(raw)
+        except cart_service.CartInputError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        cart_service.replace_cart(request.user, lines)
+        data = cart_service.serialize_cart(request.user, request)
+        data['removed'] = skipped + data['removed']
+        return Response(data)
+
+    def delete(self, request):
+        cart_service.clear_cart(request.user.id)
+        return Response(cart_service.serialize_cart(request.user, request))
+
+
+class CartMergeView(APIView):
+    """Merge a guest (browser) cart into the saved cart after sign-in."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        raw = request.data.get('items') if isinstance(request.data, dict) else None
+        try:
+            lines, skipped = cart_service.parse_lines(raw, lenient=True)
+        except cart_service.CartInputError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        cart_service.merge_into_cart(request.user, lines)
+        data = cart_service.serialize_cart(request.user, request)
+        data['removed'] = skipped + data['removed']
+        return Response(data)

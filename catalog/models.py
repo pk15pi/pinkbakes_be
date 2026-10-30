@@ -749,3 +749,32 @@ class DeliverySlot(models.Model):
 
     def __str__(self):
         return self.label
+
+
+class Cart(models.Model):
+    """A signed-in customer's saved cart. Prices are never stored (see catalog/cart.py)."""
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='cart')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'Cart of {self.user_id}'
+
+
+class CartItem(models.Model):
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='cart_items')
+    options = models.JSONField(default=dict, blank=True)
+    # Canonical JSON of `options`, so the same cake + same choices is one line.
+    options_key = models.CharField(max_length=255, blank=True, default='')
+    quantity = models.PositiveSmallIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['cart', 'product', 'options_key'], name='uniq_cart_item_product_options'),
+        ]
+
+    def __str__(self):
+        return f'{self.quantity} x {self.product_id}'
