@@ -4,6 +4,8 @@ from django.contrib.auth import get_user_model
 from django.db import models
 from django.utils.text import slugify
 
+from .pricing import discounted_unit_price
+
 
 User = get_user_model()
 
@@ -65,8 +67,7 @@ class Product(models.Model):
 
     @property
     def discounted_price(self):
-        discount_value = Decimal(self.discount or 0) / Decimal(100)
-        return (self.price * (Decimal(1) - discount_value)).quantize(Decimal('0.01'))
+        return discounted_unit_price(self.price, self.discount)
 
     def base_price_for_size(self, size=None):
         """BUG-026: list price (before discount) for a chosen cake size.
@@ -82,8 +83,7 @@ class Product(models.Model):
         return Decimal(str(prices[size]))
 
     def discounted_price_for_size(self, size=None):
-        discount_value = Decimal(self.discount or 0) / Decimal(100)
-        return (self.base_price_for_size(size) * (Decimal(1) - discount_value)).quantize(Decimal('0.01'))
+        return discounted_unit_price(self.base_price_for_size(size), self.discount)
 
     def save(self, *args, **kwargs):
         if not self.slug:

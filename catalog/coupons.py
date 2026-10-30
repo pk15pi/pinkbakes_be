@@ -25,6 +25,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import Coupon, CouponRedemption, Order, Product
+from .pricing import round_rupees
 
 
 class CouponError(ValueError):
@@ -106,9 +107,9 @@ def compute_discount_amount(coupon, eligible_subtotal):
         raw = eligible_subtotal * (Decimal(coupon.discount_value) / Decimal('100'))
     else:
         raw = Decimal(coupon.discount_value)
-    discount = _quantize(raw)
+    discount = round_rupees(raw)
     if coupon.maximum_discount_amount is not None:
-        discount = min(discount, _quantize(coupon.maximum_discount_amount))
+        discount = min(discount, round_rupees(coupon.maximum_discount_amount))
     discount = min(discount, eligible_subtotal)
     if discount < 0:
         discount = Decimal('0.00')

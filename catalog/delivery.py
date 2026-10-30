@@ -38,6 +38,9 @@ class DeliveryError(ValueError):
     """Raised when delivery cannot be offered for the given address/cart."""
 
 
+from .pricing import round_rupees
+
+
 def _quantize(amount):
     return Decimal(amount).quantize(Decimal("0.01"))
 
@@ -171,18 +174,18 @@ def compute_delivery(
 
     # Base charge
     if zone is not None:
-        charge = _quantize(zone.delivery_charge)
+        charge = round_rupees(zone.delivery_charge)
         result["zone"] = zone
         result["zone_id"] = zone.id
         result["eta_min_minutes"] = zone.eta_min_minutes
         result["eta_max_minutes"] = zone.eta_max_minutes
     else:
-        charge = _quantize(settings_row.default_delivery_charge)
+        charge = round_rupees(settings_row.default_delivery_charge)
 
     # Optional per-km add-on when distance known and per_km_charge configured.
     per_km = settings_row.per_km_charge
     if per_km is not None and distance_km is not None:
-        charge = _quantize(charge + _quantize(per_km) * Decimal(str(round(distance_km, 3))))
+        charge = round_rupees(charge + _quantize(per_km) * Decimal(str(round(distance_km, 3))))
 
     # Free delivery threshold: zone overrides global when set.
     free_threshold = None
