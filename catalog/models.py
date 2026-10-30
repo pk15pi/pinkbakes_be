@@ -273,6 +273,10 @@ class Order(models.Model):
     delivery_started_at = models.DateTimeField(null=True, blank=True)
     delivery_completed_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True, default='')
+    # Optional customer-chosen delivery window (snapshot of DeliverySlot at checkout).
+    delivery_date = models.DateField(null=True, blank=True)
+    delivery_slot = models.ForeignKey('DeliverySlot', related_name='orders', on_delete=models.SET_NULL, null=True, blank=True)
+    delivery_slot_label = models.CharField(max_length=80, blank=True, default='')
     cancellation_reason = models.TextField(blank=True, default='')
     cancelled_by = models.ForeignKey(User, related_name='cancelled_orders', on_delete=models.SET_NULL, null=True, blank=True)
     cancelled_at = models.DateTimeField(null=True, blank=True)
@@ -689,3 +693,59 @@ class DeliverySettings(models.Model):
     def get_solo(cls):
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
+
+
+
+class GalleryItem(models.Model):
+    """Admin-managed homepage gallery photo ("Made to Be Shared")."""
+
+    image_url = models.URLField(max_length=500)
+    alt_text = models.CharField(max_length=200)
+    caption = models.CharField(max_length=80, blank=True, default='')
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+
+    def __str__(self):
+        return self.caption or self.alt_text
+
+
+class Testimonial(models.Model):
+    """Admin-managed homepage customer testimonial ("What Our Customers Say")."""
+
+    name = models.CharField(max_length=80)
+    text = models.TextField(max_length=600)
+    tag = models.CharField(max_length=60, blank=True, default='')
+    rating = models.PositiveSmallIntegerField(default=5)
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+
+    def __str__(self):
+        return self.name
+
+
+class DeliverySlot(models.Model):
+    """Admin-configured delivery time window customers may optionally pick at checkout."""
+
+    label = models.CharField(max_length=80)
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'start_time', 'id']
+
+    def __str__(self):
+        return self.label

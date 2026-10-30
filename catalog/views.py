@@ -33,7 +33,8 @@ from .admin_ops import (
     validate_order_status_transition,
 )
 from .constants import CATALOG_CATEGORIES, CATEGORY_FALLBACK_IMAGES
-from .throttles import CATALOG_READ_THROTTLES
+from .site_content import SlotError, resolve_delivery_slot
+from .throttles import CATALOG_READ_THROTTLES, DELIVERY_QUOTE_THROTTLES
 from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, EmployeeCategory, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
 from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeCategorySerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductListSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
 from notifications import events as notification_events
@@ -757,6 +758,11 @@ class PaymentCreateView(APIView):
         except DeliveryError as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        try:
+            slot_fields = resolve_delivery_slot(request.data)
+        except SlotError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         with transaction.atomic():
             order = Order.objects.create(
                 user=request.user,
@@ -781,6 +787,7 @@ class PaymentCreateView(APIView):
                 tax_amount=totals['tax_amount'],
                 total_amount=totals['total_amount'],
                 notes=(request.data.get('notes') or '').strip(),
+                **slot_fields,
                 status='PENDING',
                 payment_status='pending',
             )
@@ -1581,13 +1588,52 @@ class AdminReviewRejectView(APIView):
         return Response({'message': 'Review rejected successfully.', 'review': ReviewSerializer(review).data}, status=status.HTTP_200_OK)
 
 
+def _save_uploaded_product_image(request, upload):
+    """Validate an uploaded image (JPEG/PNG/WebP, size-capped) and store it under MEDIA_ROOT/products/.
+
+    Returns the absolute public URL. Raises ValueError with a user-facing message.
+    """
+    import uuid
+
+    from django.core.files.storage import default_storage
+    from PIL import Image, UnidentifiedImageError
+
+    max_bytes = int(getattr(settings, 'PRODUCT_IMAGE_MAX_BYTES', 5 * 1024 * 1024))
+    if upload.size is None or upload.size <= 0:
+        raise ValueError('Uploaded image is empty.')
+    if upload.size > max_bytes:
+        raise ValueError(f'Image is too large (max {max_bytes // (1024 * 1024)} MB).')
+    allowed = {'JPEG': 'jpg', 'PNG': 'png', 'WEBP': 'webp'}
+    try:
+        upload.seek(0)
+        with Image.open(upload) as img:
+            fmt = (img.format or '').upper()
+            img.verify()
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
+        raise ValueError('Upload a valid JPEG, PNG or WebP image.')
+    if fmt not in allowed:
+        raise ValueError('Upload a valid JPEG, PNG or WebP image.')
+    upload.seek(0)
+    name = default_storage.save(f'products/{uuid.uuid4().hex}.{allowed[fmt]}', upload)
+    return request.build_absolute_uri(default_storage.url(name))
+
+
 class ProductAssetUploadView(APIView):
+    """Set a product's image / 3D assets.
+
+    Accepts JSON or form data with an ``image`` URL (http(s) or /media/ path), or a
+    multipart ``image_file`` upload (JPEG/PNG/WebP, max PRODUCT_IMAGE_MAX_BYTES) that is
+    saved under MEDIA_ROOT/products/ and set as the main image.
+    """
+
     permission_classes = [IsAdminUser]
 
     def post(self, request, product_id):
         product = Product.objects.filter(id=product_id).first()
         if not product:
             return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        upload = request.FILES.get('image_file')
 
         def _safe_asset_url(value, field_name='asset'):
             raw = (value or '').strip() if isinstance(value, str) else ''
@@ -1603,7 +1649,15 @@ class ProductAssetUploadView(APIView):
             return raw
 
         try:
-            if 'image' in request.data:
+            if upload is not None:
+                previous_main = product.main_image
+                product.main_image = _save_uploaded_product_image(request, upload)
+                # The upload replaces the main image everywhere it was used in the gallery.
+                product.images = [product.main_image] + [
+                    img for img in (product.images or []) if img and img != previous_main and img != product.main_image
+                ]
+                product.save(update_fields=['main_image', 'images'])
+            elif 'image' in request.data:
                 product.main_image = _safe_asset_url(request.data.get('image'), 'image')
                 product.images = list(product.images or [])
                 if product.main_image and product.main_image not in product.images:
@@ -1623,7 +1677,7 @@ class ProductAssetUploadView(APIView):
 
         AdminActivity.objects.create(
             admin_user=request.user,
-            action='product_image_upload' if 'image' in request.data else 'product_3d_upload',
+            action='product_image_upload' if (upload is not None or 'image' in request.data) else 'product_3d_upload',
             entity_type='product',
             entity_id=product.id,
             description=f"Updated assets for {product.name}",
@@ -1661,6 +1715,11 @@ class OrderCheckoutView(APIView):
         except DeliveryError as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        try:
+            slot_fields = resolve_delivery_slot(request.data)
+        except SlotError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         with transaction.atomic():
             order = Order.objects.create(
                 user=request.user,
@@ -1685,6 +1744,7 @@ class OrderCheckoutView(APIView):
                 tax_amount=totals['tax_amount'],
                 total_amount=totals['total_amount'],
                 notes=(request.data.get('notes') or '').strip(),
+                **slot_fields,
                 status='PENDING',
                 payment_status='pending',
             )
@@ -1762,7 +1822,8 @@ class AdminOrderListView(APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request):
-        orders = Order.objects.all().select_related('user', 'delivery_employee').prefetch_related('items').order_by('-created_at')
+        # Prefetch everything OrderSerializer touches (items, status_history, refunds) to avoid N+1.
+        orders = Order.objects.all().select_related('user', 'delivery_employee', 'cancelled_by').prefetch_related('items', 'status_history', 'refunds').order_by('-created_at')
 
         status_filter = (request.query_params.get('status') or '').strip()
         payment_status = (request.query_params.get('payment_status') or '').strip()
@@ -2796,16 +2857,31 @@ class AdminCouponRedemptionsView(APIView):
 
 
 class DeliveryQuoteView(APIView):
-    """Preview delivery charge/eligibility before payment. Auth required."""
+    """Preview delivery charge/eligibility before payment.
 
-    permission_classes = [permissions.IsAuthenticated]
+    Read-only, so guests may call it (throttled by THROTTLE_DELIVERY_QUOTE). Guests can
+    only quote by inline address / postal code: saved addresses (address_id) and coupons
+    still require sign-in.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = DELIVERY_QUOTE_THROTTLES
 
     def post(self, request):
         items = request.data.get('items') or []
         coupon_code = (request.data.get('coupon_code') or '').strip()
+        is_guest = not (request.user and request.user.is_authenticated)
+
+        if is_guest and coupon_code:
+            return Response({'detail': 'Sign in to apply coupons.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        quote_data = request.data
+        if is_guest and request.data.get('address_id') not in (None, '', 0, '0'):
+            # Never look up saved addresses for anonymous callers.
+            quote_data = {k: v for k, v in request.data.items() if k != 'address_id'}
 
         try:
-            shipping = delivery_service.resolve_shipping_from_request(request.user, request.data)
+            shipping = delivery_service.resolve_shipping_from_request(request.user, quote_data)
         except DeliveryError as exc:
             # Allow quoting with only postal_code when no full address yet
             postal = (request.data.get('postal_code') or '').strip()

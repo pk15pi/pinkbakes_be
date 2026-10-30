@@ -85,3 +85,23 @@ class DeliveryZoneAdmin(admin.ModelAdmin):
 @admin.register(DeliverySettings)
 class DeliverySettingsAdmin(admin.ModelAdmin):
     list_display = ('delivery_enabled', 'default_delivery_charge', 'free_delivery_threshold', 'max_delivery_radius_km', 'updated_at')
+
+from .models import DeliverySlot, GalleryItem, Testimonial
+
+
+@admin.register(GalleryItem)
+class GalleryItemAdmin(admin.ModelAdmin):
+    list_display = ('caption', 'alt_text', 'sort_order', 'is_active')
+    list_editable = ('sort_order', 'is_active')
+
+
+@admin.register(Testimonial)
+class TestimonialAdmin(admin.ModelAdmin):
+    list_display = ('name', 'tag', 'rating', 'sort_order', 'is_active')
+    list_editable = ('sort_order', 'is_active')
+
+
+@admin.register(DeliverySlot)
+class DeliverySlotAdmin(admin.ModelAdmin):
+    list_display = ('label', 'start_time', 'end_time', 'sort_order', 'is_active')
+    list_editable = ('sort_order', 'is_active')

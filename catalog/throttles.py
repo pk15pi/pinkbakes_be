@@ -32,3 +32,12 @@ class CatalogWriteAnonThrottle(AnonRateThrottle):
 
 
 CATALOG_READ_THROTTLES = [CatalogReadAnonThrottle, CatalogWriteAnonThrottle, UserRateThrottle]
+
+
+class DeliveryQuoteAnonThrottle(AnonRateThrottle):
+    """Anonymous (guest) delivery quotes: THROTTLE_DELIVERY_QUOTE (read-only preview)."""
+
+    scope = 'delivery_quote'
+
+
+DELIVERY_QUOTE_THROTTLES = [DeliveryQuoteAnonThrottle, UserRateThrottle]

@@ -10,6 +10,17 @@ from .admin_ops import (
     AdminSettingsStatusView,
     AdminUnassignDeliveryView,
 )
+from .site_content import (
+    AdminDeliverySlotDetailView,
+    AdminDeliverySlotListView,
+    AdminGalleryDetailView,
+    AdminGalleryListView,
+    AdminTestimonialDetailView,
+    AdminTestimonialListView,
+    PublicDeliverySlotView,
+    PublicGalleryView,
+    PublicTestimonialView,
+)
 from .views import (
     AdminAssignDeliveryView,
     AdminInventoryAdjustView,
@@ -141,4 +152,14 @@ urlpatterns = [
     path('admin/delivery-zones/', AdminDeliveryZoneListCreateView.as_view(), name='admin-delivery-zone-list'),
     path('admin/delivery-zones/<int:zone_id>/', AdminDeliveryZoneDetailView.as_view(), name='admin-delivery-zone-detail'),
     path('admin/delivery-settings/', AdminDeliverySettingsView.as_view(), name='admin-delivery-settings'),
+    # Admin-managed site content and delivery slots (public lists are read-only, active rows only).
+    path('site/gallery/', PublicGalleryView.as_view(), name='site-gallery'),
+    path('site/testimonials/', PublicTestimonialView.as_view(), name='site-testimonials'),
+    path('delivery/slots/', PublicDeliverySlotView.as_view(), name='delivery-slots'),
+    path('admin/gallery/', AdminGalleryListView.as_view(), name='admin-gallery-list'),
+    path('admin/gallery/<int:pk>/', AdminGalleryDetailView.as_view(), name='admin-gallery-detail'),
+    path('admin/testimonials/', AdminTestimonialListView.as_view(), name='admin-testimonial-list'),
+    path('admin/testimonials/<int:pk>/', AdminTestimonialDetailView.as_view(), name='admin-testimonial-detail'),
+    path('admin/delivery-slots/', AdminDeliverySlotListView.as_view(), name='admin-delivery-slot-list'),
+    path('admin/delivery-slots/<int:pk>/', AdminDeliverySlotDetailView.as_view(), name='admin-delivery-slot-detail'),
 ]

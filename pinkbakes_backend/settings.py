@@ -140,6 +140,7 @@ if _database_url:
         'default': dj_database_url.parse(
             _database_url,
             conn_max_age=_db_conn_max_age,
+            conn_health_checks=True,
             ssl_require=_env_bool('DB_SSL_REQUIRE', not DEBUG),
         )
     }
@@ -156,6 +157,8 @@ elif _db_engine in ('postgresql', 'postgres', 'django.db.backends.postgresql'):
             'HOST': os.environ.get('POSTGRES_HOST', 'localhost'),
             'PORT': os.environ.get('POSTGRES_PORT', '5432'),
             'CONN_MAX_AGE': _db_conn_max_age,
+            # Persistent connections (DB_CONN_MAX_AGE, default 600s) are checked before reuse.
+            'CONN_HEALTH_CHECKS': True,
             'OPTIONS': _pg_options,
         }
     }
@@ -204,6 +207,8 @@ REST_FRAMEWORK = {
         'otp': os.environ.get('THROTTLE_OTP', '8/minute'),
         'payment': os.environ.get('THROTTLE_PAYMENT', '30/minute'),
         'admin_login': os.environ.get('THROTTLE_ADMIN_LOGIN', '10/minute'),
+        # Guest delivery-charge preview (DeliveryQuoteView, AllowAny).
+        'delivery_quote': os.environ.get('THROTTLE_DELIVERY_QUOTE', '60/hour'),
     },
 }
 
@@ -275,6 +280,8 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # Cap uploaded body size (admin asset URL posts are small; guards multipart abuse).
 DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get('DATA_UPLOAD_MAX_MEMORY_SIZE', str(2 * 1024 * 1024)))
 FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get('FILE_UPLOAD_MAX_MEMORY_SIZE', str(2 * 1024 * 1024)))
+# Admin product image file uploads (ProductAssetUploadView). nginx client_max_body_size must allow this.
+PRODUCT_IMAGE_MAX_BYTES = int(os.environ.get('PRODUCT_IMAGE_MAX_BYTES', str(5 * 1024 * 1024)))
 
 LOGGING = {
     'version': 1,
@@ -307,5 +314,6 @@ if "test" in sys.argv:
         "otp": "100000/minute",
         "payment": "100000/minute",
         "admin_login": "100000/minute",
+        "delivery_quote": "100000/minute",
     }
 

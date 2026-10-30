@@ -212,6 +212,9 @@ class OrderSerializer(serializers.ModelSerializer):
             'delivery_started_at',
             'delivery_completed_at',
             'notes',
+            'delivery_date',
+            'delivery_slot',
+            'delivery_slot_label',
             'cancellation_reason',
             'cancelled_by',
             'cancelled_at',
@@ -235,8 +238,9 @@ class OrderSerializer(serializers.ModelSerializer):
         refunds = getattr(obj, 'refunds', None)
         if refunds is None:
             return []
-        qs = refunds.all().order_by('-created_at')
-        return RefundSerializer(qs, many=True).data
+        # Sort in Python so a prefetch_related('refunds') is reused (order_by would re-query).
+        rows = sorted(refunds.all(), key=lambda r: r.created_at, reverse=True)
+        return RefundSerializer(rows, many=True).data
 
     def get_refunds_summary(self, obj):
         refunds = list(getattr(obj, 'refunds', Refund.objects.none()).all())
