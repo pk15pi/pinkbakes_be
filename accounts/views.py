@@ -6,6 +6,8 @@ from urllib.parse import quote
 from django.conf import settings
 from django.contrib.auth import login
 from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.contrib.auth.models import User
 from django.utils import timezone
 from rest_framework import status
@@ -605,6 +607,10 @@ class ResetPasswordView(APIView):
             return Response({'detail': 'This password reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
         user = reset_token.user
+        try:
+            validate_password(password, user=user)
+        except DjangoValidationError as exc:
+            return Response({'detail': ' '.join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
         user.set_password(password)
         user.save(update_fields=['password'])
 

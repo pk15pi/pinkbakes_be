@@ -18,7 +18,7 @@ CATALOG_CATEGORIES = [
 # Local FE public static cake images (category-matched). Collab 3D uses product.image.
 CATEGORY_FALLBACK_IMAGES = {
     'Birthday Cakes': '/products/cakes/BirthdayCakes_BerryMedley.jpg',
-    'Anniversary Cakes': '/products/cakes/AnniversaryCakes_BlackForest.jpg',
+    'Anniversary Cakes': '/products/cakes/AnniversaryCakes_BlackForest2.jpg',
     'Wedding Cakes': '/products/cakes/WeddingCakes_AlmondMarzipan.jpg',
     'Chocolate Cakes': '/products/cakes/ChocolateCakes_BlackForest2.jpg',
     'Designer Cakes': '/products/cakes/DesignerCakes_BerryMedley.jpg',

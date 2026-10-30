@@ -31,7 +31,7 @@ class AuthSecretLeakTests(TestCase):
                 "username": "secuser1",
                 "email": "secuser1@example.com",
                 "mobile_number": "9876500001",
-                "password": "SecurePass123",
+                "password": "Velvet-Sponge-4821",
             },
             format="json",
         )

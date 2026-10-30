@@ -4,6 +4,8 @@ from datetime import timedelta
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.hashers import make_password
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.contrib.auth.models import User
 from django.utils import timezone
 from rest_framework import serializers
@@ -41,6 +43,19 @@ class SignupSerializer(serializers.ModelSerializer):
         if len(re.sub(r'\D', '', cleaned)) < 10:
             raise serializers.ValidationError('Mobile number must be at least 10 digits.')
         return cleaned
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # Apply the project's configured AUTH_PASSWORD_VALIDATORS (similarity, common, numeric, length).
+        candidate = User(
+            username=attrs.get('username') or '', email=attrs.get('email') or '',
+            first_name=attrs.get('first_name') or '', last_name=attrs.get('last_name') or '',
+        )
+        try:
+            validate_password(attrs.get('password') or '', user=candidate)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'password': list(exc.messages)})
+        return attrs
 
     def create(self, validated_data):
         password = validated_data.pop('password')
@@ -93,6 +108,11 @@ class SigninSerializer(serializers.Serializer):
 
         user = authenticate(username=username, password=password)
         if not user:
+            # ModelBackend returns None for inactive users even with the right password.
+            # Only when the password is correct, tell them the account still needs verification.
+            pending = User.objects.filter(username=username, is_active=False).first()
+            if pending and pending.check_password(password):
+                raise serializers.ValidationError('Your account has not been verified. Please verify your email or mobile number before signing in.')
             raise serializers.ValidationError('Invalid username or password.')
 
         if not user.is_active:

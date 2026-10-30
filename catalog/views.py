@@ -68,7 +68,10 @@ class AdminLoginView(APIView):
 
         user = None
         if '@' in username:
-            user = User.objects.filter(email__iexact=username).first()
+            # Email lookup must still verify the password (previously any password was accepted).
+            candidate = User.objects.filter(email__iexact=username).first()
+            if candidate and candidate.check_password(password):
+                user = candidate
         if user is None:
             user = authenticate(username=username, password=password)
         if user is None and '@' not in username:
@@ -76,7 +79,7 @@ class AdminLoginView(APIView):
             if user and not user.check_password(password):
                 user = None
 
-        if not user or not user.is_staff:
+        if not user or not user.is_active or not user.is_staff:
             return Response({'detail': 'Invalid admin credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
 
         login(request, user)
