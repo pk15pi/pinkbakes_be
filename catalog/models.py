@@ -19,12 +19,17 @@ class Product(models.Model):
         ('published', 'Published'),
         ('archived', 'Archived'),
     ]
+    # Cake sizes offered in the product popup (mirrors CAKE_SIZE_OPTIONS in the frontend).
+    SIZE_OPTIONS = ('0.5 kg', '1 kg', '1.5 kg', '2 kg')
 
     name = models.CharField(max_length=120)
     slug = models.SlugField(max_length=150, unique=True, blank=True)
     category = models.CharField(max_length=80, default='Birthday Cakes')
     price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     discount = models.PositiveSmallIntegerField(default=0)
+    # BUG-026: optional admin-set list price per size, e.g. {"0.5 kg": "699.00"}.
+    # Empty = every size sells at `price` (legacy behaviour). Discount applies on top.
+    size_prices = models.JSONField(default=dict, blank=True)
     short_description = models.TextField(blank=True, default='')
     description = models.TextField(blank=True, default='')
     main_image = models.URLField(blank=True, default='')
@@ -62,6 +67,23 @@ class Product(models.Model):
     def discounted_price(self):
         discount_value = Decimal(self.discount or 0) / Decimal(100)
         return (self.price * (Decimal(1) - discount_value)).quantize(Decimal('0.01'))
+
+    def base_price_for_size(self, size=None):
+        """BUG-026: list price (before discount) for a chosen cake size.
+
+        No size chosen, or no per-size prices configured -> the catalog `price`.
+        When per-size prices exist, only those sizes can be ordered (ValueError otherwise).
+        """
+        prices = self.size_prices if isinstance(self.size_prices, dict) else {}
+        if not prices or size in (None, ''):
+            return self.price
+        if size not in prices:
+            raise ValueError(f'Size "{size}" is not available for "{self.name}". Please choose another size.')
+        return Decimal(str(prices[size]))
+
+    def discounted_price_for_size(self, size=None):
+        discount_value = Decimal(self.discount or 0) / Decimal(100)
+        return (self.base_price_for_size(size) * (Decimal(1) - discount_value)).quantize(Decimal('0.01'))
 
     def save(self, *args, **kwargs):
         if not self.slug:

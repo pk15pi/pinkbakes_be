@@ -1,6 +1,7 @@
 import logging
 import secrets
 from datetime import timedelta
+from urllib.parse import quote
 
 from django.conf import settings
 from django.contrib.auth import login
@@ -14,6 +15,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from notifications import events as notification_events
+from notifications.service import frontend_link
 from notifications.service import notify as notify_event
 from .models import PasswordResetToken, UserProfile
 from .serializers import SigninSerializer, SignupSerializer
@@ -42,13 +44,11 @@ def _maybe_log_dev_otp(purpose):
 
 
 def _verification_link(token):
-    base_url = getattr(settings, 'FRONTEND_URL', 'https://pinkbakes.com')
-    return f"{base_url.rstrip('/')}/verify-email?token={token}"
+    return frontend_link(f"verify-email?token={quote(str(token), safe='')}")
 
 
 def _password_reset_link(token):
-    base_url = getattr(settings, 'FRONTEND_URL', 'https://pinkbakes.com')
-    return f"{base_url.rstrip('/')}/reset-password/{token}"
+    return frontend_link(f"reset-password/{quote(str(token), safe='')}")
 
 
 def _mask_email(email):

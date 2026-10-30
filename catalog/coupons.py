@@ -166,10 +166,16 @@ def validate_coupon(user, code, cart_items, *, lock=False):
             product = Product.objects.filter(id=product_id, is_active=True).first()
             if not product:
                 raise CouponError(f'Product #{product_id} is unavailable.')
+            options = item.get('options') if isinstance(item.get('options'), dict) else {}
+            size = options.get('size')
+            try:
+                unit_price = product.discounted_price_for_size(size.strip() if isinstance(size, str) else None)
+            except ValueError as exc:
+                raise CouponError(str(exc))
             cart_rows.append({
                 'product': product,
                 'quantity': quantity,
-                'unit_price': product.discounted_price,
+                'unit_price': unit_price,
             })
 
     eligible_subtotal, full_subtotal = _eligible_line_total(coupon, cart_rows)

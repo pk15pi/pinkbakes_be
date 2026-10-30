@@ -2671,6 +2671,21 @@ class OrderItemOptionsRegressionTests(TestCase):
         detail = self.client.get(f"/api/orders/{response.json()['id']}/")
         self.assertEqual(detail.json()['items'][0]['options'], expected)
 
+    def test_price_is_computed_server_side_and_size_does_not_change_it(self):
+        """BUG-026: no per-size price data exists, so every size is charged the catalog price.
+        Client-sent prices are ignored; the server uses Product.discounted_price."""
+        self.product.discount = 10
+        self.product.save()
+        response = self.client.post('/api/orders/checkout/', self._payload([
+            {'id': self.product.id, 'quantity': 1, 'price': '1.00', 'unit_price': '1.00', 'options': {'size': '0.5 kg'}},
+            {'id': self.product.id, 'quantity': 2, 'price': '1.00', 'options': {'size': '2 kg'}},
+        ]), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        items = OrderItem.objects.filter(order_id=response.json()['id']).order_by('id')
+        self.assertEqual([i.unit_price for i in items], [Decimal('720.00'), Decimal('720.00')])
+        self.assertEqual([i.subtotal for i in items], [Decimal('720.00'), Decimal('1440.00')])
+        self.assertEqual(Order.objects.get(id=response.json()['id']).subtotal_amount, Decimal('2160.00'))
+
     def test_same_product_with_different_options_stays_two_lines(self):
         response = self.client.post('/api/orders/checkout/', self._payload([
             {'id': self.product.id, 'quantity': 1, 'options': {'size': '1 kg', 'message': 'A'}},

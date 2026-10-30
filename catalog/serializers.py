@@ -1,3 +1,5 @@
+from decimal import Decimal, InvalidOperation
+
 from django.db.models import Avg, Count
 from django.utils.text import slugify
 from rest_framework import serializers
@@ -337,6 +339,7 @@ class ProductSerializer(serializers.ModelSerializer):
     price = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False, default=0)
     rating = serializers.DecimalField(max_digits=3, decimal_places=1, min_value=0, max_value=5, required=False, default=0)
     discount = serializers.IntegerField(min_value=0, max_value=100, required=False, default=0)
+    size_prices = serializers.JSONField(required=False)
     available_quantity = serializers.IntegerField(min_value=0, required=False)
     low_stock_threshold = serializers.IntegerField(min_value=0, required=False)
     stock_remaining = serializers.SerializerMethodField()
@@ -354,6 +357,7 @@ class ProductSerializer(serializers.ModelSerializer):
             'price',
             'discount',
             'discounted_price',
+            'size_prices',
             'short_description',
             'description',
             'main_image',
@@ -465,6 +469,37 @@ class ProductSerializer(serializers.ModelSerializer):
         return data
 
 
+    def validate_size_prices(self, value):
+        """BUG-026: {size: price}. Sizes must be ones the product popup offers; prices must be
+        positive with at most 2 decimals. Blank prices are dropped (size left unpriced)."""
+        if value in (None, ''):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Size prices must be an object of size -> price.')
+        cleaned = {}
+        for raw_size, raw_price in value.items():
+            size = str(raw_size).strip()
+            if size not in Product.SIZE_OPTIONS:
+                raise serializers.ValidationError(
+                    f'Unknown size "{size}". Allowed sizes: {", ".join(Product.SIZE_OPTIONS)}.'
+                )
+            if raw_price is None or (isinstance(raw_price, str) and not raw_price.strip()):
+                continue
+            if isinstance(raw_price, bool) or not isinstance(raw_price, (int, float, str)):
+                raise serializers.ValidationError(f'Price for {size} must be a number.')
+            try:
+                price = Decimal(str(raw_price).strip())
+            except (InvalidOperation, ValueError):
+                raise serializers.ValidationError(f'Price for {size} must be a number.')
+            if not price.is_finite() or price <= 0:
+                raise serializers.ValidationError(f'Price for {size} must be greater than zero.')
+            if price.as_tuple().exponent < -2:
+                raise serializers.ValidationError(f'Price for {size} can have at most 2 decimal places.')
+            if price >= Decimal('100000000'):
+                raise serializers.ValidationError(f'Price for {size} is too large.')
+            cleaned[size] = str(price.quantize(Decimal('0.01')))
+        return {size: cleaned[size] for size in Product.SIZE_OPTIONS if size in cleaned}
+
     def validate_discount(self, value):
         if value is None:
             return 0
@@ -513,7 +548,7 @@ class ProductSerializer(serializers.ModelSerializer):
             instance.images = validated_data['images']
         if 'three_d_assets' in validated_data:
             instance.three_d_assets = validated_data['three_d_assets']
-        for field in ['category', 'price', 'discount', 'short_description', 'description', 'three_d_model', 'availability', 'status', 'badge', 'featured', 'delivery_time', 'is_active', 'available_quantity', 'low_stock_threshold']:
+        for field in ['category', 'price', 'discount', 'size_prices', 'short_description', 'description', 'three_d_model', 'availability', 'status', 'badge', 'featured', 'delivery_time', 'is_active', 'available_quantity', 'low_stock_threshold']:
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
         instance.save()
@@ -552,6 +587,7 @@ class ProductListSerializer(serializers.ModelSerializer):
             'price',
             'discount',
             'discounted_price',
+            'size_prices',
             'short_description',
             'description',
             'main_image',

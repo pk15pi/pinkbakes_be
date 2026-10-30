@@ -401,6 +401,11 @@ def notify_low_stock(product, previous_availability=''):
     )
 
 
+def frontend_link(path):
+    """Absolute link into the storefront, always built from settings.FRONTEND_URL (BUG-025)."""
+    return f"{settings.FRONTEND_URL.rstrip('/')}/{str(path).lstrip('/')}"
+
+
 def tracking_url_for_order(order):
-    base = getattr(settings, 'FRONTEND_URL', 'https://pinkbakes.com').rstrip('/')
-    return f'{base}/orders/{order.pk}/tracking'
+    # The storefront opens My Orders -> this order -> live tracking for /orders/<id>/tracking.
+    return frontend_link(f'orders/{order.pk}/tracking')

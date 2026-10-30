@@ -197,6 +197,8 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_THROTTLE_RATES': {
         'anon': os.environ.get('THROTTLE_ANON', '240/hour'),
+        # BUG-023: anonymous read-only catalog requests (categories, products, reviews).
+        'catalog_read': os.environ.get('THROTTLE_CATALOG_READ', '3000/hour'),
         'user': os.environ.get('THROTTLE_USER', '2000/hour'),
         'auth': os.environ.get('THROTTLE_AUTH', '20/minute'),
         'otp': os.environ.get('THROTTLE_OTP', '8/minute'),
@@ -299,6 +301,7 @@ LOGGING = {
 if "test" in sys.argv:
     REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
         "anon": "100000/minute",
+        "catalog_read": "100000/minute",
         "user": "100000/minute",
         "auth": "100000/minute",
         "otp": "100000/minute",

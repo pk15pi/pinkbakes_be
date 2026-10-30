@@ -1,9 +1,11 @@
+import re
 from datetime import timedelta
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.core import mail
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -262,3 +264,51 @@ class OtpLockoutAndThrottleTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+@override_settings(FRONTEND_URL='https://shop.example.test/')
+class EmailLinkRouteTests(TestCase):
+    """BUG-025: every link we email must point at a storefront route that handles it."""
+
+    # Routes the React app handles for emailed links (src/seo.js emailLinkFromPath + reset-password).
+    FRONTEND_ROUTES = (
+        re.compile(r'^/verify-email$'),
+        re.compile(r'^/reset-password/[^/]+$'),
+        re.compile(r'^/orders/\d+/tracking$'),
+    )
+
+    def assert_storefront_link(self, url):
+        parts = urlsplit(url)
+        self.assertEqual(f'{parts.scheme}://{parts.netloc}', 'https://shop.example.test')
+        self.assertTrue(any(r.match(parts.path) for r in self.FRONTEND_ROUTES), url)
+        return parts
+
+    def test_password_reset_email_links_to_reset_route_with_working_token(self):
+        user = User.objects.create_user(username='linkuser', email='linkuser@example.com', password='OldPassword123')
+        self.client.post('/api/accounts/forgot-password/', {'email': user.email}, format='json')
+        self.assertEqual(len(mail.outbox), 1)
+        body = mail.outbox[0].alternatives[0][0] if mail.outbox[0].alternatives else mail.outbox[0].body
+        url = re.search(r'href="([^"]+reset-password[^"]+)"', body).group(1)
+        parts = self.assert_storefront_link(url)
+        token = unquote(parts.path.rsplit('/', 1)[1])
+        response = self.client.post('/api/accounts/verify-reset-token/', {'token': token}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_verification_link_uses_verify_route_and_token_verifies(self):
+        from .models import UserProfile
+        from .views import _verification_link
+        user = User.objects.create_user(username='verifyme', email='verifyme@example.com', password='OldPassword123', is_active=False)
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        profile.verification_token = 'tok-123/abc'
+        profile.save()
+        parts = self.assert_storefront_link(_verification_link(profile.verification_token))
+        token = parse_qs(parts.query)['token'][0]
+        self.assertEqual(token, 'tok-123/abc')
+        response = self.client.post('/api/accounts/verify-email/', {'token': token}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_tracking_link_uses_configured_frontend_url(self):
+        from types import SimpleNamespace
+        from notifications.service import tracking_url_for_order
+        parts = self.assert_storefront_link(tracking_url_for_order(SimpleNamespace(pk=42)))
+        self.assertEqual(parts.path, '/orders/42/tracking')

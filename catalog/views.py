@@ -33,6 +33,7 @@ from .admin_ops import (
     validate_order_status_transition,
 )
 from .constants import CATALOG_CATEGORIES, CATEGORY_FALLBACK_IMAGES
+from .throttles import CATALOG_READ_THROTTLES
 from .models import AdminActivity, Coupon, CouponRedemption, DeliveryLocation, DeliverySettings, DeliveryZone, Employee, EmployeeCategory, InventoryTransaction, Order, OrderItem, OrderStatusHistory, Payment, Product, ProductView, Refund, Review
 from .serializers import CouponRedemptionSerializer, CouponSerializer, DeliveryLocationSerializer, DeliverySettingsSerializer, DeliveryZoneSerializer, EmployeeCategorySerializer, EmployeeSerializer, OrderSerializer, PaymentSerializer, ProductListSerializer, ProductSerializer, RefundSerializer, ReviewSerializer
 from notifications import events as notification_events
@@ -131,7 +132,7 @@ class PaymentService:
             subtotal += (product.discounted_price * quantity)
         return subtotal.quantize(Decimal('0.01'))
 
-    CAKE_SIZE_OPTIONS = ('0.5 kg', '1 kg', '1.5 kg', '2 kg')
+    CAKE_SIZE_OPTIONS = Product.SIZE_OPTIONS
     CAKE_MESSAGE_MAX_LENGTH = 60
     DELIVERY_DATE_MAX_DAYS_AHEAD = 365
 
@@ -222,11 +223,14 @@ class PaymentService:
                 raise ValueError(
                     f'Only {available} units of "{product.name}" are currently available.'
                 )
+            options = PaymentService.clean_item_options(item.get('options'), product)
+            # BUG-026: unit price = per-size price (if configured) less the product discount.
+            # Client-sent prices are never read.
             normalized.append({
                 'product': product,
                 'quantity': quantity,
-                'unit_price': product.discounted_price,
-                'options': PaymentService.clean_item_options(item.get('options'), product),
+                'unit_price': product.discounted_price_for_size((options or {}).get('size')),
+                'options': options,
             })
         # Re-check aggregated quantities under current stock.
         totals = {}
@@ -1106,6 +1110,7 @@ class CategoryListView(APIView):
     product, plus any extra category strings present on published products.
     """
     permission_classes = [permissions.AllowAny]
+    throttle_classes = CATALOG_READ_THROTTLES  # BUG-023
 
     def get(self, request):
         from .cache_utils import CATEGORIES_KEY, CATEGORIES_TTL
@@ -1180,6 +1185,7 @@ class ProductListView(generics.ListAPIView):
     """
     serializer_class = ProductListSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = CATALOG_READ_THROTTLES  # BUG-023
     pagination_class = None
 
     def get_queryset(self):
@@ -1229,6 +1235,7 @@ class ProductSlugDetailView(generics.RetrieveAPIView):
     ).prefetch_related('reviews')
     serializer_class = ProductSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = CATALOG_READ_THROTTLES  # BUG-023
     lookup_field = 'slug'
 
     def retrieve(self, request, *args, **kwargs):
@@ -1250,6 +1257,7 @@ class ProductDetailView(generics.RetrieveAPIView):
     ).prefetch_related('reviews')
     serializer_class = ProductSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = CATALOG_READ_THROTTLES  # BUG-023
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1319,6 +1327,7 @@ def update_product_rating(product):
 
 class ProductReviewListView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = CATALOG_READ_THROTTLES  # BUG-023
 
     def get(self, request, product_id):
         product = Product.objects.filter(id=product_id, is_active=True).first()
